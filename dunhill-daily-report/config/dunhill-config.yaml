@@ -1,0 +1,104 @@
+# Dunhill Daily Report Configuration
+# IMPORTANT: Do not commit this file to version control with real credentials
+
+credentials:
+  # Taobao seller platform credentials
+  taobao_username: "dunhill登喜路官方旗舰店:安娜"
+  # Use environment variable for password: set TAOBAO_PASSWORD=your_password
+  taobao_password: "${TAOBAO_PASSWORD}"
+
+paths:
+  # Taobao and Live Platform URLs
+  refund_list_url: "https://myseller.taobao.com/home.htm/trade-platform/refund-list"
+  live_overview_url: "https://liveplatform.taobao.com/restful/index/live/overview?forceShowLegacyVersion=true"
+  live_transaction_url: "https://liveplatform.taobao.com/restful/index/data/transaction?page=OrderDetail"
+
+  # Python data import scripts (loaded from .env)
+  data_import_dir: "${ETL_PIPELINES_DIR}"
+  run_script: "${ETL_PIPELINES_DIR}/run.py"
+  manage_script: "${ETL_PIPELINES_DIR}/manage.py"
+
+  # Excel template files
+  pfs_excel: "${DUNHILL_DATA_DIR}/daily_report/pfs/dunhill pfs daily report.xlsx"
+  dtc_excel: "${DUNHILL_DATA_DIR}/daily_report/dtc/dunhill OFS&WBTQ daily sales report.xlsx"
+
+  # Output directories for snapshots and screenshots
+  pfs_snapfile_dir: "${DUNHILL_DATA_DIR}/daily_report/pfs/daily_report_snapfile"
+  dtc_snapfile_dir: "${DUNHILL_DATA_DIR}/daily_report/dtc/daily_report_snapfile"
+  pfs_snapshot_dir: "${DUNHILL_DATA_DIR}/daily_report/pfs/daily_report_snapshot"
+  dtc_snapshot_dir: "${DUNHILL_DATA_DIR}/daily_report/dtc/daily_report_snapshot"
+
+  # Download directories
+  download_dir: "${DOWNLOAD_DIR}"
+
+# QuickBI URLs for manual download when tables exceed 50 rows
+quickbi:
+  tm_order_url: "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=1065de5c-5f49-4086-9f3c-3451cb6d8444&accessTicket=b2b373ed-5eed-4aab-accf-2b9b3852994f&qbi_version_param=1"
+  dtc_order_url: "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=04bdfcf3-c547-42a5-8a43-3a80264ff3d1&accessTicket=f9f48bad-12fa-4cbb-a663-d7d42c450c0a"
+  dtc_refund_url: "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=b08a2190-66d7-4004-8ca0-9a6a92857dff&accessTicket=a3db8cff-4532-4f9b-a608-a0269d559bf6"
+
+# Email template settings
+email:
+  # Template files (user must provide these in assets/email_templates/)
+  pfs_template: "assets/email_templates/pfs_email_template.msg"
+  dtc_template: "assets/email_templates/dtc_email_template.msg"
+  # Date placeholder format in templates
+  date_placeholder: "{date}"
+
+  # PFS Email recipients
+  pfs_to:
+    - "Dunhill <dunhill.ops@baozun.com>"
+    - "GUO Tracy (DUN-CN) <tracy-ym.guo@dunhill.com>"
+    - "HUANG Hamish (EXT-DUN-CN) <hamish.huang@dunhill.com>"
+    - "LI Yao (DUN) <yao.li@dunhill.com>"
+    - "jessica.yu <jessica.yu@dunhill.com>"
+    - "jack-yj.wu@dunhill.com"
+  pfs_cc:
+    - "esohe.omoruyi <esohe.omoruyi@richemont.com>"
+    - "jessica.chan <jessica.chan@richemont.com>"
+    - "amy.qian@richemont.com"
+    - "MA Rain-J (DUN-CN) <rain-j.ma@dunhill.com>"
+    - "mandy-md.wang@richemont.com"
+    - "karen.kang@richemont.com"
+    - "Cherrie Li <cherrie.li@baozun.com>"
+
+  # DTC Email recipients (same as PFS)
+  dtc_to:
+    - "Dunhill <dunhill.ops@baozun.com>"
+    - "GUO Tracy (DUN-CN) <tracy-ym.guo@dunhill.com>"
+    - "HUANG Hamish (EXT-DUN-CN) <hamish.huang@dunhill.com>"
+    - "LI Yao (DUN) <yao.li@dunhill.com>"
+    - "jessica.yu <jessica.yu@dunhill.com>"
+    - "jack-yj.wu@dunhill.com"
+  dtc_cc:
+    - "esohe.omoruyi <esohe.omoruyi@richemont.com>"
+    - "jessica.chan <jessica.chan@richemont.com>"
+    - "amy.qian@richemont.com"
+    - "MA Rain-J (DUN-CN) <rain-j.ma@dunhill.com>"
+    - "mandy-md.wang@richemont.com"
+    - "karen.kang@richemont.com"
+    - "Cherrie Li <cherrie.li@baozun.com>"
+
+  # Email font settings
+  font_family: "Dunhill"
+  font_size: "11pt"
+
+# Automation settings
+settings:
+  # Excel automation
+  excel_wait_timeout: 300  # Maximum seconds to wait for Excel refresh (5 minutes)
+  excel_visible: true      # Show Excel window during automation (useful for debugging)
+
+  # Screenshot settings
+  screenshot_dpi: 96       # Resolution for screenshots
+  screenshot_format: "jpg"
+
+  # Browser automation
+  download_wait_timeout: 60   # Maximum seconds to wait for download completion
+  browser_headless: false     # Show browser window (useful for login debugging)
+  browser_slow_mo: 1000       # Slow down actions by X milliseconds (for debugging)
+  browser_user_data_dir: "${PLAYWRIGHT_PROFILES_DIR}/dunhill-daily-report"  # Persistent browser profile for session saving
+
+  # Script execution
+  script_check_interval: 5    # Seconds between output checks when monitoring run.py
+  script_max_wait: 1800       # Maximum seconds to wait for run.py completion (30 minutes)

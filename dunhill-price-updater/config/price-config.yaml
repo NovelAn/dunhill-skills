@@ -1,0 +1,31 @@
+# Dunhill商品价格更新配置
+
+# 价格文件配置
+price_files:
+  # 价格变动文件所在目录
+  directory: "${DUNHILL_DATA_DIR}/product/调价清单"
+  # 文件名模式 (支持日期占位符)
+  pattern: "PRICE_*.xlsx"
+
+# 数据库配置
+database:
+  # 使用database_config.json中的数据库配置名称
+  config_name: "Aliyun DB"
+  # 目标表名
+  table_name: "dunhill_价格源"
+
+# 数据筛选配置
+filter:
+  # 零售价字段名
+  retail_price_field: "ZRSP"
+  # 只处理零售价不为空的记录
+  require_retail_price: true
+
+# 字段映射 (Excel列名 -> 数据库字段)
+field_mapping:
+  "ART - Hier. Lvl 5": "category"        # 商品类目
+  "spu": "spu"                           # SPU编码
+  "Product - Name": "name"              # 商品名称
+  "CON - Valid From": "validFrom"       # 生效日期
+  "CON - Valid To": "validTo"           # 失效日期
+  "ZRSP": "rsp"                         # 零售价格

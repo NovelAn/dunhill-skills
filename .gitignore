@@ -1,0 +1,24 @@
+# === 白名单模式：只追踪 dunhill 相关 skills ===
+
+# 忽略所有内容
+/*
+
+# 以下不忽略（git 追踪）
+!.gitignore
+!.env.example
+!dunhill-daily-report/
+!dunhill-price-updater/
+!dunhill-product-checker/
+!dunhill-product-info-updater/
+!dunhill-regular-report/
+
+# 各 skill 内部忽略
+__pycache__/
+*.pyc
+*.pyo
+.browser_profile/
+.DS_Store
+Thumbs.db
+
+# 本机配置（不入 Git）
+.env
