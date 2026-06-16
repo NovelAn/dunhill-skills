@@ -22,3 +22,9 @@ Thumbs.db
 
 # 本机配置（不入 Git）
 .env
+**/.venv/
+
+# 浏览器登录态/缓存（不入 Git）
+**/.config/playwright-profiles/
+**/.playwright-mcp/
+**/runs/

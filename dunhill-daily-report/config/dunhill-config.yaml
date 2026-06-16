@@ -93,12 +93,19 @@ settings:
   screenshot_dpi: 96       # Resolution for screenshots
   screenshot_format: "jpg"
 
-  # Browser automation
-  download_wait_timeout: 60   # Maximum seconds to wait for download completion
-  browser_headless: false     # Show browser window (useful for login debugging)
-  browser_slow_mo: 1000       # Slow down actions by X milliseconds (for debugging)
-  browser_user_data_dir: "${PLAYWRIGHT_PROFILES_DIR}/dunhill-daily-report"  # Persistent browser profile for session saving
-
   # Script execution
   script_check_interval: 5    # Seconds between output checks when monitoring run.py
   script_max_wait: 1800       # Maximum seconds to wait for run.py completion (30 minutes)
+
+# Notification settings
+notifications:
+  lark:
+    enabled: true
+    send_identity: "user"
+    chat_name: "数据更新提醒"
+    chat_id: "oc_2713a524be31fe0092cbfe94533407ac"
+    mention_members:
+      - name: "徐加琪"
+        open_id: "ou_93e3e19a20ea365d45100d3cf12ddfa7"
+      - name: "唐玉霞"
+        open_id: "ou_4cc7d465193b13fd72094cd65f0121d7"

@@ -9,8 +9,19 @@ import locale
 
 # ====== 加载 .env 跨平台路径配置 ======
 from pathlib import Path as _P
-_env_file = _P.home() / ".claude" / "skills" / ".env"
-if _env_file.exists():
+
+# 尝试从 skill 符号链接路径加载，再尝试 dunhill-skills 原始路径
+_env_candidates = [
+    _P.home() / ".claude" / "skills" / ".env",
+    _P.home() / ".claude" / "skills" / "dunhill-skills" / ".env",
+]
+_env_file = None
+for _p in _env_candidates:
+    if _p.exists():
+        _env_file = _p
+        break
+
+if _env_file:
     with open(_env_file, encoding="utf-8") as _f:
         for _line in _f:
             _line = _line.strip()
@@ -19,6 +30,13 @@ if _env_file.exists():
                 _k, _v = _k.strip(), _v.strip()
                 if _k and _k not in os.environ:
                     os.environ[_k] = _v
+
+# ====== 自动检测并切换到项目 venv Python（仅在需要时）======
+# 注意：此功能已暂时禁用，等待进一步调试
+# _etl_dir = os.path.expanduser(os.environ.get("ETL_PIPELINES_DIR", "~/projects/data-import"))
+# _venv_python = os.path.join(_etl_dir, ".venv", "bin", "python")
+# if os.path.exists(_venv_python) and sys.executable != _venv_python:
+#     os.execv(_venv_python, [_venv_python, "-u", __file__] + sys.argv[1:])
 
 # ====== Windows 中文编码修复 ======
 if sys.platform == 'win32':
@@ -72,6 +90,7 @@ class TaskTracker:
             'nick_crawler': {'status': 'pending', 'name': '买家昵称爬取'},
             'pfs_buyer_update': {'status': 'pending', 'name': 'PFS买家类型更新'},
             'dtc_buyer_update': {'status': 'pending', 'name': 'DTC买家类型更新'},
+            'alimama': {'status': 'pending', 'name': '阿里妈妈数据爬取'},
             'file_verification': {'status': 'pending', 'name': '文件完整性验证'},
             'jycm_retry': {'status': 'pending', 'name': '经营参谋补下载'},
         }
@@ -188,7 +207,7 @@ def _resolve_env_vars(obj):
         def _replace(match):
             var_name = match.group(1)
             value = os.environ.get(var_name, match.group(0))
-            return value
+            return os.path.expanduser(value)
         return re.sub(r'\$\{(\w+)\}', _replace, obj)
     elif isinstance(obj, dict):
         return {k: _resolve_env_vars(v) for k, v in obj.items()}
@@ -216,6 +235,20 @@ REQUIRED_QUICKBI_FILES = [
     "BI_dtc_t01_trade_refund_info_allsuc_filter",
 ]
 
+STEP1_UPLOAD_PATTERNS = [
+    ("退款源", ["[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9].xlsx"]),
+    ("直播大盘", ["直播间大盘数据-*.xlsx"]),
+    ("直播场次", ["直播分场次效果*.xlsx", "*分场次效果*.xlsx"]),
+    ("直播订单", ["直播间成交订单明细*.xlsx"]),
+    ("TM订单补充", ["BI_tm_t01_trade_order_line*.xlsx"]),
+    ("TM退款成功补充", ["BI_tm_trade_refund_info_allsuc_filter*.xlsx"]),
+    ("TM待退款补充", ["BI_tm_trade_refund_info_paydate_filter*.xlsx"]),
+    ("经营参谋店铺源", ["dunhill_shop_d_recent_*.xlsx"]),
+    ("经营参谋流量源", ["dunhill_traffic_d_recent_*.xlsx"]),
+    ("经营参谋商品源", ["dunhill_product_d_recent_*.xlsx"]),
+    ("经营参谋商品流量源", ["dunhill_product_traffic_d_recent_*.xlsx"]),
+]
+
 
 def get_download_path():
     """Get the Downloads folder path."""
@@ -223,6 +256,70 @@ def get_download_path():
     if custom_download_path and os.path.exists(custom_download_path):
         return custom_download_path
     return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+def get_default_save_path():
+    """Get the file_uploader backup path used after files leave Downloads."""
+    data_dir = os.getenv("DUNHILL_DATA_DIR")
+    if data_dir:
+        candidate = os.path.join(data_dir, "文件下载")
+        if os.path.exists(candidate):
+            return candidate
+
+    data_import_backup = Path.home() / "Projects" / "data-import" / "backup"
+    if data_import_backup.exists():
+        return str(data_import_backup)
+
+    return os.path.join(os.getenv("DUNHILL_DATA_DIR", ""), "文件下载")
+
+
+def file_mtime_is_today(path, day=None):
+    """Check whether file modification time falls on the local calendar day."""
+    if day is None:
+        day = date.today()
+    modified = date.fromtimestamp(os.path.getmtime(path))
+    return modified == day
+
+
+def find_step1_upload_residuals(download_path, day=None):
+    """
+    Return today's Step 1 raw-source files still left in Downloads.
+
+    Upload completion for this workflow is defined by these files being moved out
+    of Downloads into the data-import backup folders by file_uploader.
+    """
+    if day is None:
+        day = date.today()
+
+    residuals = []
+    seen = set()
+    for label, patterns in STEP1_UPLOAD_PATTERNS:
+        for pattern in patterns:
+            for file_path in glob.glob(os.path.join(download_path, pattern)):
+                if not os.path.isfile(file_path):
+                    continue
+                if not file_mtime_is_today(file_path, day):
+                    continue
+                key = os.path.abspath(file_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                residuals.append({
+                    "label": label,
+                    "path": key,
+                    "name": os.path.basename(file_path),
+                })
+    return residuals
+
+
+def date_tokens(date_text):
+    """Return compact and hyphenated date strings for file-name matching."""
+    text = str(date_text)
+    compact = text.replace("-", "")
+    if len(compact) == 8 and compact.isdigit():
+        hyphen = f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+        return compact, hyphen
+    return text, text
 
 
 def check_required_jycm_files(download_path, today_str, save_path=None):
@@ -239,10 +336,10 @@ def check_required_jycm_files(download_path, today_str, save_path=None):
 
     # 默认SavePath（file_uploader移动文件的目标路径）
     if save_path is None:
-        save_path = os.path.join(os.getenv("DUNHILL_DATA_DIR", ""), "文件下载")
+        save_path = get_default_save_path()
 
     # 支持两种日期格式：20260310 和 2026-03-10
-    today_str_hyphen = today_str[:4] + '-' + today_str[4:6] + '-' + today_str[6:8]
+    today_compact, today_hyphen = date_tokens(today_str)
 
     for report_id, file_prefix in REQUIRED_JYCM_DAILY_REPORTS:
         # 跳过客户源文件检查
@@ -254,16 +351,16 @@ def check_required_jycm_files(download_path, today_str, save_path=None):
 
         # Check if file exists in Downloads (支持两种日期格式)
         files = glob.glob(pattern2)
-        today_files = [f for f in files if today_str in f or today_str_hyphen in f]
+        today_files = [f for f in files if today_compact in f or today_hyphen in f]
 
         if not today_files:
             # 检查文件是否已移动到SavePath (支持两种日期格式)
-            save_pattern = os.path.join(save_path, "**", f"{file_prefix}*{today_str}*.xlsx")
+            save_pattern = os.path.join(save_path, "**", f"{file_prefix}*{today_compact}*.xlsx")
             saved_files = glob.glob(save_pattern, recursive=True)
 
             # 也检查带连字符的日期格式
             if not saved_files:
-                save_pattern_hyphen = os.path.join(save_path, "**", f"{file_prefix}*{today_str_hyphen}*.xlsx")
+                save_pattern_hyphen = os.path.join(save_path, "**", f"{file_prefix}*{today_hyphen}*.xlsx")
                 saved_files = glob.glob(save_pattern_hyphen, recursive=True)
 
             if not saved_files:
@@ -282,24 +379,24 @@ def check_required_quickbi_files(download_path, today_str, save_path=None):
 
     # 默认SavePath（file_uploader移动文件的目标路径）
     if save_path is None:
-        save_path = os.path.join(os.getenv("DUNHILL_DATA_DIR", ""), "文件下载")
+        save_path = get_default_save_path()
 
     # 支持两种日期格式：20260310 和 2026-03-10
-    today_str_hyphen = today_str[:4] + '-' + today_str[4:6] + '-' + today_str[6:8]
+    today_compact, today_hyphen = date_tokens(today_str)
 
     for file_prefix in REQUIRED_QUICKBI_FILES:
         pattern = os.path.join(download_path, f"{file_prefix}*.xlsx")
         files = glob.glob(pattern)
-        today_files = [f for f in files if today_str in f or today_str_hyphen in f]
+        today_files = [f for f in files if today_compact in f or today_hyphen in f]
 
         if not today_files:
             # 检查文件是否已移动到SavePath (支持两种日期格式)
-            save_pattern = os.path.join(save_path, "**", f"{file_prefix}*{today_str}*.xlsx")
+            save_pattern = os.path.join(save_path, "**", f"{file_prefix}*{today_compact}*.xlsx")
             saved_files = glob.glob(save_pattern, recursive=True)
 
             # 也检查带连字符的日期格式
             if not saved_files:
-                save_pattern_hyphen = os.path.join(save_path, "**", f"{file_prefix}*{today_str_hyphen}*.xlsx")
+                save_pattern_hyphen = os.path.join(save_path, "**", f"{file_prefix}*{today_hyphen}*.xlsx")
                 saved_files = glob.glob(save_pattern_hyphen, recursive=True)
 
             if not saved_files:
@@ -307,6 +404,252 @@ def check_required_quickbi_files(download_path, today_str, save_path=None):
                 missing.append(file_prefix)
 
     return len(missing) == 0, missing
+
+
+def run_taobao_login_interactive(data_import_dir):
+    """
+    Run the Taobao login helper, auto-selecting menu option 1.
+
+    The login helper still needs a human to scan/confirm in Chrome. This wrapper
+    keeps that interaction in the current terminal, then returns to Step 2 so it
+    can re-check cookies and continue automatically.
+    """
+    login_script = os.path.join(data_import_dir, "scripts", "login", "taobao_login.py")
+    if not os.path.exists(login_script):
+        print(f"  [FAIL] 未找到登录脚本: {login_script}")
+        return False
+
+    print("\n" + "=" * 70)
+    print("  千牛 cookies 已过期，自动启动登录脚本")
+    print("=" * 70)
+    print("  [AUTO] 将自动选择: 1. 千牛/淘宝")
+    print("  [ACTION] 浏览器打开后，请完成扫码/验证；脚本提示时按 Enter 继续。")
+
+    def chrome_has_taobao_session():
+        script = '''
+tell application "Google Chrome"
+  repeat with w in windows
+    repeat with t in tabs of w
+      set u to URL of t
+      if (u contains "myseller.taobao.com" or u contains "trade.taobao.com") and u does not contain "login" then
+        return u
+      end if
+    end repeat
+  end repeat
+end tell
+return ""
+'''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        url = result.stdout.strip()
+        return url or None
+
+    def wait_for_taobao_session(timeout=300):
+        print("  [WAIT] 当前环境无法读取终端 Enter，改为自动等待 Chrome 登录成功...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            url = chrome_has_taobao_session()
+            if url:
+                print(f"  [OK] 检测到千牛/淘宝登录态: {url}")
+                return True
+            time.sleep(2)
+        print("  [FAIL] 等待 Chrome 登录成功超时")
+        return False
+
+    if os.name != "posix":
+        print("  [WARN] 当前系统不支持 PTY 自动菜单选择，请手动选择 1。")
+        result = subprocess.run([sys.executable, "-u", login_script], cwd=data_import_dir)
+        return result.returncode == 0
+
+    import pty
+    import select
+
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-u", login_script],
+        cwd=data_import_dir,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    sent_menu_choice = False
+    output_window = ""
+    enter_prompt_markers = [
+        "按回车继续",
+        "按回车键继续",
+    ]
+
+    try:
+        while process.poll() is None:
+            ready, _, _ = select.select([master_fd], [], [], 0.2)
+            if not ready:
+                continue
+
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+
+            text = data.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            output_window = (output_window + text)[-4000:]
+
+            if not sent_menu_choice and "请输入选项" in output_window:
+                os.write(master_fd, b"1\n")
+                sent_menu_choice = True
+                output_window = ""
+                continue
+
+            if sent_menu_choice and any(marker in output_window for marker in enter_prompt_markers):
+                print("\n  [WAIT] 请在浏览器中完成登录/验证后，回到这里按 Enter 继续...", flush=True)
+                if sys.stdin.isatty():
+                    try:
+                        input()
+                    except EOFError:
+                        print("  [WARN] 当前环境无法读取 Enter 输入，改为自动检测 Chrome 登录态。")
+                        if not wait_for_taobao_session():
+                            process.terminate()
+                            return False
+                else:
+                    if not wait_for_taobao_session():
+                        process.terminate()
+                        return False
+                os.write(master_fd, b"\n")
+                output_window = ""
+
+        while True:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if not ready:
+                break
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            sys.stdout.write(data.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    return_code = process.wait()
+    if return_code == 0:
+        print("\n  [OK] 登录脚本执行完成")
+        return True
+    print(f"\n  [FAIL] 登录脚本返回码: {return_code}")
+    return False
+
+
+def run_taobao_login_mcp(data_import_dir):
+    """Run the MCP-based Taobao login updater in the user's normal Chrome."""
+    login_script = os.path.join(data_import_dir, "scripts", "login", "taobao_login_mcp.py")
+    if not os.path.exists(login_script):
+        print(f"  [WARN] 未找到 MCP 登录脚本: {login_script}")
+        return False
+
+    print("\n" + "=" * 70)
+    print("  千牛 cookies 已过期，优先使用本机 Chrome MCP 登录更新")
+    print("=" * 70)
+    print("  [ACTION] 如出现二维码，请用手机淘宝/千牛扫码；脚本会自动继续。")
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", login_script],
+        cwd=data_import_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line.rstrip())
+    return_code = process.wait()
+    if return_code == 0:
+        print("  [OK] MCP 登录脚本执行完成")
+        return True
+    print(f"  [WARN] MCP 登录脚本失败，返回码: {return_code}")
+    return False
+
+
+def run_alimama_auth_refresh(manage_script, data_import_dir, tracker=None):
+    """Refresh Alimama csrfId/cookies through local Chrome MCP before crawling."""
+    print("\n" + "=" * 70)
+    print("  阿里妈妈认证刷新: Playwright MCP Extension + 本机 Chrome")
+    print("=" * 70)
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", manage_script, "alimama", "--refresh-auth"],
+        cwd=data_import_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line.rstrip())
+
+    return_code = process.wait()
+    if return_code == 0:
+        print("  [OK] 阿里妈妈认证刷新完成")
+        return True
+
+    print(f"  [WARN] 阿里妈妈认证刷新失败，返回码: {return_code}")
+    if tracker:
+        tracker.update_status('alimama', 'warning', '认证刷新失败，后续爬虫会尝试自动刷新')
+    return False
+
+
+def run_alimama_crawler(manage_script, data_import_dir, tracker):
+    """Run the daily Alimama crawler as an independent Step 2 task."""
+    tracker.update_status('alimama', 'running', '正在抓取并入库阿里妈妈数据')
+
+    print("\n" + "=" * 70)
+    print("  Step 2: 执行阿里妈妈数据爬取")
+    print("=" * 70)
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", manage_script, "alimama"],
+        cwd=data_import_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line.rstrip())
+
+    return_code = process.wait()
+    if return_code == 0:
+        tracker.update_status('alimama', 'completed', '阿里妈妈数据爬取完成')
+        return True
+
+    tracker.update_status('alimama', 'failed', f'阿里妈妈爬虫返回码: {return_code}')
+    return False
 
 
 def download_single_jycm_file(args):
@@ -416,7 +759,7 @@ def download_missing_jycm_files(missing_files, download_path, today_str, max_ret
     return still_missing
 
 
-def run_file_uploader(data_import_dir):
+def run_file_uploader(data_import_dir, timeout=900):
     """Run the file_uploader.py script to upload all files to database."""
     uploader_script = os.path.join(data_import_dir, 'src', 'data_pipeline', 'processors', 'file_uploader.py')
 
@@ -430,7 +773,7 @@ def run_file_uploader(data_import_dir):
             cwd=data_import_dir,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=timeout,
             encoding='utf-8',
             errors='replace'
         )
@@ -450,11 +793,64 @@ def run_file_uploader(data_import_dir):
             return False
 
     except subprocess.TimeoutExpired:
-        print(f"       [WARN] 文件上传超时")
+        print(f"       [WARN] 文件上传超时 ({timeout}s)")
         return False
     except Exception as e:
         print(f"       [ERROR] 文件上传失败: {e}")
         return False
+
+
+def print_upload_residuals(residuals, prefix="       -"):
+    for item in residuals:
+        print(f"{prefix} {item['label']}: {item['name']}")
+
+
+def residual_key(residuals):
+    return sorted(item["path"] for item in residuals)
+
+
+def drain_upload_residuals(data_import_dir, download_path, tracker, day=None, max_attempts=3):
+    """
+    Upload raw source files until Downloads is clean.
+
+    file_uploader logs/return codes are not reliable enough for this workflow:
+    success is defined only by all expected raw files moving out of Downloads.
+    """
+    residuals = find_step1_upload_residuals(download_path, day)
+    if not residuals:
+        tracker.update_status('file_upload', 'completed', '原始文件已迁移出 Downloads')
+        print("\n  [OK] 所有原始数据文件已迁移出 Downloads，可视为上传完成")
+        return True
+
+    tracker.update_status('file_upload', 'warning', f'发现 {len(residuals)} 个原始文件仍留在 Downloads')
+    print("\n  [WARN] 发现今天的原始数据文件仍留在 Downloads，执行文件上传直到清空...")
+    print_upload_residuals(residuals)
+
+    previous_key = residual_key(residuals)
+    for attempt in range(1, max_attempts + 1):
+        print(f"\n  [>>] 文件上传补偿尝试 {attempt}/{max_attempts}")
+        time.sleep(3)
+        run_file_uploader(data_import_dir)
+
+        residuals = find_step1_upload_residuals(download_path, day)
+        if not residuals:
+            tracker.update_status('file_upload', 'completed', '残留原始文件已迁移到 backup')
+            print("       [OK] 文件上传完成，原始文件已迁移出 Downloads")
+            return True
+
+        current_key = residual_key(residuals)
+        tracker.update_status('file_upload', 'warning', f'仍有 {len(residuals)} 个原始文件留在 Downloads')
+        print("       [WARN] 文件上传后仍有原始文件残留:")
+        print_upload_residuals(residuals, prefix="              -")
+        if current_key == previous_key:
+            break
+        previous_key = current_key
+
+    tracker.update_status('file_upload', 'failed', '文件上传后仍有原始文件残留')
+    print("       [FAIL] 文件上传后仍有原始文件残留，不能继续后置任务")
+    print_upload_residuals(residuals, prefix="              -")
+    tracker.print_summary()
+    return False
 
 
 def run_order_crawlers(data_import_dir):
@@ -463,13 +859,8 @@ def run_order_crawlers(data_import_dir):
 
     执行顺序（重要）:
     1. file_uploader 必须先完成
-    2. nick_crawler 和 fq_crawler 串行执行（都是千牛后台，并发有风险）
-    3. 买家类型更新（PFS/DTC）可以与爬虫并发执行（纯SQL操作）
-
-    并发策略:
-    - 买家类型更新在后台线程执行
-    - 爬虫任务串行执行（先nick后fq，或反过来）
-    - 最后等待买家类型更新完成
+    2. UpdateMaskedBuyerNicknames 必须在爬虫前完成
+    3. fq_crawler / nick_crawler / PFS买家类型 / DTC买家类型 可并发执行
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
@@ -477,13 +868,14 @@ def run_order_crawlers(data_import_dir):
     print(f"\n  {'='*60}")
     print(f"  执行后续任务: 爬虫和买家类型更新...")
     print(f"  {'='*60}")
-    print(f"  执行策略: 爬虫串行(千牛后台) + 买家类型更新并发(SQL)")
+    print(f"  执行策略: mask 完成后，并发执行 fq/nick/PFS/DTC")
 
     # Add project paths for imports
     sys.path.insert(0, data_import_dir)
     sys.path.insert(0, os.path.join(data_import_dir, 'src'))
 
     results = {
+        'mask_update': False,
         'fq_crawler': False,
         'nick_crawler': False,
         'pfs_buyer_update': False,
@@ -539,21 +931,16 @@ def run_order_crawlers(data_import_dir):
         print(f"\n  [>>] 执行存储过程 UpdateMaskedBuyerNicknames（解密历史老客昵称）...")
         try:
             user_info.call_buyer_types_update_execute("UpdateMaskedBuyerNicknames")
+            update_result('mask_update', True)
             print(f"       [OK] 存储过程执行成功")
         except Exception as e:
             print(f"       [WARN] 存储过程执行失败: {str(e)[:80]}")
 
-        # 使用线程池并发执行买家类型更新
-        with ThreadPoolExecutor(max_workers=2) as buyer_type_pool:
-            # 提交买家类型更新任务到后台
-            pfs_future = buyer_type_pool.submit(run_pfs_buyer_update, user_info)
-            dtc_future = buyer_type_pool.submit(run_dtc_buyer_update, user_info)
+        def run_nick_crawler():
+            if not results.get('mask_update'):
+                print(f"\n  [WARN] 跳过买家昵称爬虫：UpdateMaskedBuyerNicknames 未成功完成")
+                return
 
-            print(f"\n  [INFO] 买家类型更新已在后台启动，开始串行执行爬虫任务...")
-
-            # ===== 串行执行爬虫任务（千牛后台，不能并发）=====
-
-            # 1. 买家昵称爬虫
             print(f"\n  [>>] 执行买家昵称爬虫（千牛后台）...")
             try:
                 user_info.nick_spider_execute("dunhill_bi订单源")
@@ -562,7 +949,7 @@ def run_order_crawlers(data_import_dir):
             except Exception as e:
                 print(f"       [WARN] 买家昵称爬虫执行失败: {str(e)[:50]}")
 
-            # 2. 分期购爬虫（等待昵称爬虫完成后执行）
+        def run_fq_crawler():
             print(f"\n  [>>] 执行分期购爬虫（千牛后台）...")
             try:
                 user_info.fq_spider_execute("dunhill_tm订单分期购")
@@ -571,10 +958,15 @@ def run_order_crawlers(data_import_dir):
             except Exception as e:
                 print(f"       [WARN] 分期购爬虫执行失败: {str(e)[:50]}")
 
-            # 等待买家类型更新完成
-            print(f"\n  [>>] 等待买家类型更新完成...")
-            pfs_future.result()  # 等待PFS完成
-            dtc_future.result()  # 等待DTC完成
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(run_fq_crawler),
+                pool.submit(run_nick_crawler),
+                pool.submit(run_pfs_buyer_update, user_info),
+                pool.submit(run_dtc_buyer_update, user_info),
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     except ImportError as e:
         print(f"       [ERROR] 无法导入所需模块: {e}")
@@ -584,12 +976,19 @@ def run_order_crawlers(data_import_dir):
 
     # Summary
     success_count = sum(1 for v in results.values() if v)
-    print(f"\n  后续任务完成: {success_count}/4")
+    print(f"\n  后续任务完成: {success_count}/5")
 
     return results
 
 
-def run_import_script(config, skip_upload=False, auto_retry=True):
+def run_import_script(
+    config,
+    skip_upload=False,
+    auto_retry=True,
+    auto_login=True,
+    refresh_alimama_auth_first=False,
+    run_alimama=True,
+):
     """Execute run.py and monitor for QuickBI warnings."""
     print("\n" + "=" * 70)
     print("  步骤2: 执行数据导入程序 (增强版 - 自动验证与重试)")
@@ -619,17 +1018,44 @@ def run_import_script(config, skip_upload=False, auto_retry=True):
 
         print("  [>>] 检查千牛 cookies 有效性...")
         if not check_taobao_cookie_health():
-            tracker.update_status('nick_crawler', 'failed', '千牛 cookies 已过期')
-            tracker.update_status('fq_crawler', 'failed', '千牛 cookies 已过期')
-            print("\n[!] 千牛 cookies 已过期！请先运行登录脚本更新认证：")
-            print("  python scripts/login/taobao_login.py")
-            print("更新完成后重新执行步骤2即可。")
-            tracker.print_summary()
-            os.chdir(original_dir)
-            return False
+            if auto_login:
+                tracker.update_status('nick_crawler', 'warning', '千牛 cookies 已过期，准备自动更新认证')
+                tracker.update_status('fq_crawler', 'warning', '千牛 cookies 已过期，准备自动更新认证')
+                login_ok = run_taobao_login_mcp(data_import_dir)
+                if not login_ok:
+                    print("\n  [WARN] MCP 登录更新失败，回退到旧 Playwright 登录脚本...")
+                    login_ok = run_taobao_login_interactive(data_import_dir)
+                if not login_ok:
+                    tracker.update_status('nick_crawler', 'failed', '千牛登录脚本执行失败')
+                    tracker.update_status('fq_crawler', 'failed', '千牛登录脚本执行失败')
+                    tracker.print_summary()
+                    os.chdir(original_dir)
+                    return False
+
+                print("\n  [>>] 重新检查千牛 cookies 有效性...")
+                if not check_taobao_cookie_health():
+                    tracker.update_status('nick_crawler', 'failed', '登录后千牛 cookies 仍无效')
+                    tracker.update_status('fq_crawler', 'failed', '登录后千牛 cookies 仍无效')
+                    print("\n[FAIL] 登录脚本已执行，但 cookies 仍然无效。请检查浏览器登录是否成功。")
+                    tracker.print_summary()
+                    os.chdir(original_dir)
+                    return False
+                print("  [OK] 千牛 cookies 已更新并验证通过")
+            else:
+                tracker.update_status('nick_crawler', 'failed', '千牛 cookies 已过期')
+                tracker.update_status('fq_crawler', 'failed', '千牛 cookies 已过期')
+                print("\n[!] 千牛 cookies 已过期！请先运行登录脚本更新认证：")
+                print("  python scripts/login/taobao_login.py")
+                print("更新完成后重新执行步骤2即可。")
+                tracker.print_summary()
+                os.chdir(original_dir)
+                return False
         print("  [OK] 千牛 cookies 有效")
     except Exception as e:
         print(f"  [WARN] Cookie 健康检查异常: {e}，继续执行...")
+
+    if refresh_alimama_auth_first:
+        run_alimama_auth_refresh(manage_script, data_import_dir, tracker)
 
     try:
         # Execute run.py with unbuffered output
@@ -852,50 +1278,36 @@ def run_import_script(config, skip_upload=False, auto_retry=True):
                     else:
                         tracker.update_status('jycm_retry', 'warning', f'{len(still_missing)}个文件仍缺失')
 
-                    # Re-run file uploader after retrying downloads
+                    # Re-run file uploader after retrying downloads, then verify Downloads is clean.
                     print("\n  重新执行文件上传...")
-                    upload_success = run_file_uploader(data_import_dir)
+                    upload_success = drain_upload_residuals(data_import_dir, download_path, tracker, today)
 
-                    # Run follow-up tasks: crawlers and buyer type updates
+                    # Run follow-up tasks only after upload is actually complete.
                     if upload_success:
                         print("\n  执行后续任务...")
-                        run_order_crawlers(data_import_dir)
+                        followup_results = run_order_crawlers(data_import_dir)
+                        for task, success in followup_results.items():
+                            tracker.update_status(task, 'completed' if success else 'warning')
 
         elif auto_retry and return_code == 0:
             # run.py 已经完整执行了所有任务（下载→上传→爬虫→买家类型更新）
             # 但需要检查是否有残留文件未被上传
             print("\n" + "=" * 70)
-            print("  run.py 执行成功，检查是否有残留文件...")
+            print("  run.py 执行成功，检查原始数据文件是否已迁移出 Downloads...")
             print("=" * 70)
 
             download_path = get_download_path()
-            today = date.today()
-            today_str = today.strftime("%Y-%m-%d")
+            today_day = date.today()
+            upload_success = drain_upload_residuals(data_import_dir, download_path, tracker, today_day)
+            if not upload_success:
+                return False
 
-            # 检查是否有今天的数据源文件残留（未被上传）
-            jycm_ok, missing_jycm = check_required_jycm_files(download_path, today_str)
-            quickbi_ok, missing_quickbi = check_required_quickbi_files(download_path, today_str)
-
-            # 如果文件存在但没有被上传（文件存在于Downloads但应该已被移动）
-            # 检查是否有符合今天日期的数据文件残留
-            has_residual_files = not jycm_ok or not quickbi_ok
-
-            if has_residual_files:
-                print("\n  [WARN] 发现残留的数据源文件，执行额外的文件上传...")
-
-                # 额外执行一次 file_uploader
-                time.sleep(3)  # 等待文件系统同步
-                extra_upload_success = run_file_uploader(data_import_dir)
-
-                if extra_upload_success:
-                    print("       [OK] 额外文件上传完成")
-                    # 重新执行后续任务（爬虫和买家类型更新）
-                    print("\n  [>>] 执行后续任务（确保数据完整性）...")
-                    run_order_crawlers(data_import_dir)
-                else:
-                    print("       [WARN] 额外文件上传有警告")
-            else:
-                print("\n  [OK] 所有文件已正确上传，无需额外处理")
+            # run.py may have continued after a false upload success. Re-run follow-up
+            # tasks after verified upload completion to guarantee ordering.
+            print("\n  [>>] 执行后续任务（确保数据完整性）...")
+            followup_results = run_order_crawlers(data_import_dir)
+            for task, success in followup_results.items():
+                tracker.update_status(task, 'completed' if success else 'warning')
 
         # Check for QuickBI warnings
         if quickbi_warning_detected:
@@ -926,10 +1338,16 @@ def run_import_script(config, skip_upload=False, auto_retry=True):
             # 文件上传已在前面执行，此处无需额外处理
             print("\n  [INFO] 文件上传已在主流程中执行。")
 
+        alimama_ok = True
+        if run_alimama:
+            alimama_ok = run_alimama_crawler(manage_script, data_import_dir, tracker)
+        else:
+            tracker.update_status('alimama', 'warning', '已按参数跳过阿里妈妈任务')
+
         # Print final summary again
         tracker.print_summary()
 
-        return return_code == 0
+        return return_code == 0 and alimama_ok
 
     except Exception as e:
         print(f"[FAIL] 脚本执行错误: {str(e)}")
@@ -947,13 +1365,22 @@ if __name__ == "__main__":
                         help='Skip file upload prompt even if QuickBI warnings are detected')
     parser.add_argument('--no-auto-retry', action='store_true',
                         help='Disable automatic retry for missing files')
+    parser.add_argument('--no-auto-login', action='store_true',
+                        help='Do not auto-refresh Taobao/QianNiu cookies when they expire')
+    parser.add_argument('--refresh-alimama-auth-first', action='store_true',
+                        help='Refresh Alimama csrfId/cookies via local Chrome MCP before running the Alimama crawler')
+    parser.add_argument('--skip-alimama', action='store_true',
+                        help='Skip the daily Alimama crawler task')
     args = parser.parse_args()
 
     config = load_config()
     success = run_import_script(
         config,
         skip_upload=args.skip_upload,
-        auto_retry=not args.no_auto_retry
+        auto_retry=not args.no_auto_retry,
+        auto_login=not args.no_auto_login,
+        refresh_alimama_auth_first=args.refresh_alimama_auth_first,
+        run_alimama=not args.skip_alimama,
     )
 
     if success:

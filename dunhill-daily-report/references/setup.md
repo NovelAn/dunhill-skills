@@ -4,8 +4,12 @@
 
 ### Prerequisites
 
-- **Windows OS** with Excel 2016+ and Outlook 2016+ installed
+- **macOS or Windows** for Step 1 and Step 2 data collection/import
+- **Windows OS** with Excel 2016+ and Outlook 2016+ for Step 3-5 report refresh and email draft automation
 - **Python 3.8+**
+- **Chrome Playwright Extension** for Step 1 and Taobao cookie refresh
+
+> macOS can run the browser automation and database import steps, but Mac Excel cannot refresh the Power Query / MySQL-backed PFS and DTC workbooks. Run Steps 3-5 on Windows Excel, a remote Windows host, or a manual report-refresh workflow.
 
 ### Install Python Dependencies
 
@@ -71,51 +75,131 @@ settings:
   excel_wait_timeout: 300  # Excel refresh timeout (seconds)
   excel_visible: true      # Show Excel window (useful for debugging)
   screenshot_dpi: 96       # Screenshot resolution
-  browser_headless: false  # Show browser window
+  script_check_interval: 5 # Step 2 output polling interval
+  script_max_wait: 1800    # Step 2 maximum wait time
 ```
 
 ## Login Solutions
 
-### Option 1: Browser Session Persistence (Recommended)
+### Option 1: Playwright MCP Extension + MCP Bridge (Recommended)
 
-**Advantages**:
-- Scan QR code once, login lasts 7-30 days
-- Fully automated after first login
-- Uses official Taobao QR code login
-- Stable and reliable
+Use this path for all model runtimes, including GPT/OpenAI/Codex, MiniMax, DeepSeek, GLM, and Claude.
 
-**Setup** (First time only):
+**Setup**:
 
-1. Run the script:
+1. Install Chrome Playwright Extension.
+2. Log in to Taobao and Taobao Live Platform in your normal Chrome.
+3. Open the extension status page and copy the token shown after `PLAYWRIGHT_MCP_EXTENSION_TOKEN=`.
+4. Set it in the current shell:
    ```bash
-   python scripts/step1_collect_data.py
+   export PLAYWRIGHT_MCP_EXTENSION_TOKEN="your_token"
+   ```
+5. Run Step 1:
+   ```bash
+   python -u scripts/step1_collect_data.py
    ```
 
-2. Browser opens automatically
+`step1_collect_data.py` runs `step1_chrome_bridge.py`. The bridge navigates to refund/live pages itself and executes `export_refund_chrome.py`, `export_live.py`, and the QuickBI complete-file supplement `export_quickbi_chrome.py` through the Playwright MCP Extension.
 
-3. Use Taobao/QianNiu mobile app to scan QR code
+The QuickBI supplement checks the three TM QuickBI pages first. If a page shows `查询结果共XX条` with `XX > 50`, it creates a fresh self-service export task, waits for it to finish, then downloads only the task created after the current run started. If `XX <= 50`, it skips that source because Step 2 can capture it completely.
 
-4. Login session saved to `.browser_profile/` directory
+`export_refund.py` and the Codex Extension runner have been removed from the main skill. Do not use Codex Extension / browser-use computer-use clicks for Step 1 until that path is reliable on QianNiu/Taobao pages.
 
-**Subsequent runs**:
-- Session automatically restored
-- No login required for 7-30 days
-- When session expires, repeat the setup process
+### Step 2 Taobao Cookie Refresh
 
-**Configuration** (in `dunhill-config.yaml`):
-```yaml
-settings:
-  browser_user_data_dir: "${PLAYWRIGHT_PROFILES_DIR}/dunhill-daily-report"
+Step 2 pre-checks `.taobao.com` cookies before running the import pipeline.
+
+- If Taobao/QianNiu cookies are still valid, Step 2 runs normally.
+- If they are expired, Step 2 first runs `/Users/novel/projects/data-import/scripts/login/taobao_login_mcp.py`.
+- The MCP login script connects to normal Chrome through Playwright MCP Extension and syncs the latest Taobao/QianNiu cookies into `~/auth.json`.
+- This uses the same Chrome login state established by Step 1, so it usually avoids QR-code login.
+- QuickBI, SYCM, and JYCM cookies are lower-frequency auth files and are preserved during the merge.
+- If MCP sync fails, Step 2 falls back to the legacy interactive login flow and auto-selects option `1` for 千牛/淘宝.
+
+### Step 2 Alimama Auth Refresh
+
+Alimama auth is short-lived and often needs a daily refresh.
+
+Recommended daily Step 2 command:
+```bash
+python -u scripts/step2_run_import.py --refresh-alimama-auth-first
 ```
 
-**Security Note**: The `.browser_profile` directory contains login credentials. Never commit it to version control or share it. It's already in `.gitignore`.
+- The flag runs `python manage.py alimama --refresh-auth` before the Alimama crawler.
+- The auth refresh connects to normal Chrome through Playwright MCP Extension.
+- It captures the page/request `csrfId` and saves it to `~/alimama_config.json`.
+- It saves matching `.alimama.com` cookies to `~/alimama_cookies.json`.
+- Step 2 then runs `python manage.py alimama` as a daily data import task.
+- If the flag is omitted, the Alimama crawler still refreshes auth once after detecting CSRF failure.
+- Use `--skip-alimama` only when the Alimama platform is unavailable and the rest of Step 2 must continue.
 
-### Option 2: Chrome Remote Debugging (CDP)
+## Daily Scheduling
 
-**Advantages**:
-- Use your normal Chrome browser
-- Login persists as long as Chrome is open
-- Easy to debug and manually assist when needed
+On macOS, do not schedule the Step 1-2 orchestrator inside Codex Automation.
+Codex runs commands in a seatbelt sandbox that cannot reliably access the GUI
+session, AppleScript services, process inspection, or Playwright MCP loopback
+listeners. Install the user LaunchAgent instead:
+
+```bash
+python -u scripts/manage_launchagent.py install
+python -u scripts/manage_launchagent.py status
+```
+
+The install command also updates the existing
+`dunhill-daily-step-1-2` Codex Automation to run at 09:35 and execute only
+`scripts/report_daily_status.py`.
+
+The LaunchAgent runs this command at 09:10 in the logged-in Aqua session:
+
+```bash
+python -u scripts/daily_orchestrator.py
+```
+
+The orchestrator:
+- Runs Step 1 and Step 2 in order.
+- Refreshes Alimama auth before Step 2 by default.
+- Writes per-run state to `runs/YYYY-MM-DD/state.json`.
+- Writes step logs to `runs/YYYY-MM-DD/logs/`.
+- Uses `caffeinate -dimsu` on macOS while the run is active.
+- Sends a Feishu/Lark success notification to `数据更新提醒` after Step 1 and Step 2 both succeed.
+- Stops after Step 2 because Steps 3-5 require Windows Excel.
+
+Keep Codex Automation as a later read-only monitor. Its only project command
+must be:
+
+```bash
+python -u scripts/report_daily_status.py
+```
+
+Recommended timing is 09:35 Asia/Shanghai so the LaunchAgent normally has time
+to finish. The reporter reads state and logs; it never starts Step 1 or Step 2.
+
+LaunchAgent operations:
+
+```bash
+python -u scripts/manage_launchagent.py trigger
+python -u scripts/manage_launchagent.py status
+python -u scripts/manage_launchagent.py uninstall
+```
+
+### Lark Success Notification
+
+Success notifications are configured in `config/dunhill-config.yaml` under `notifications.lark`.
+
+Current behavior:
+- Sends as bot identity.
+- Sends to group `数据更新提醒`.
+- Mentions 徐加琪 and 唐玉霞.
+- Message says only `dunhill的日报和订单相关数据已经更新`, without script names, step numbers, state files, or logs.
+- Uses an idempotency key per run date to avoid duplicate sends.
+
+Debug options:
+```bash
+python -u scripts/daily_orchestrator.py --notify-dry-run
+python -u scripts/daily_orchestrator.py --no-notify
+```
+
+### Option 2: Chrome Remote Debugging (Legacy CDP Fallback)
 
 **Setup**:
 
@@ -165,8 +249,8 @@ Then continue with Step 2 and beyond.
 
 | Method | Automation | Stability | Setup Difficulty | Recommended For |
 |--------|-----------|-----------|------------------|-----------------|
-| Session Persistence | High | High | Easy | **Daily automated use** |
-| Chrome CDP | Very High | Very High | Medium | **Users comfortable with tech** |
+| Script + MCP Extension | High | Medium | Medium | **Daily Step 1 use** |
+| Chrome CDP legacy fallback | Very High | Medium | Medium | **Fallback only** |
 | Manual Download | Low | Very High | None | **Backup/fallback** |
 
 ## Email Templates
@@ -197,20 +281,20 @@ If templates are not provided, the script will create basic email drafts with st
 After installation, test each step individually:
 
 ```bash
-# Test Step 1 (Data collection)
-python scripts/step1_collect_data.py
+# Test Step 1 script flow
+python -u scripts/step1_collect_data.py
 
 # Test Step 2 (Import script)
-python scripts/step2_run_import.py
+python -u scripts/step2_run_import.py
 
 # Test Step 3 (PFS report)
-python scripts/step3_pfs_report.py
+python -u scripts/step3_pfs_report.py
 
 # Test Step 4 (DTC report)
-python scripts/step4_dtc_report.py
+python -u scripts/step4_dtc_report.py
 
 # Test Step 5 (Email drafts)
-python scripts/step5_email_drafts.py
+python -u scripts/step5_email_drafts.py
 ```
 
 Verify outputs in configured directories before running the full workflow.
