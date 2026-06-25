@@ -41,6 +41,18 @@ QUICKBI_SOURCES = {
         "url": "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=3524b197-ccbb-4b51-a6e6-bb8848571ade&accessTicket=38c30a99-5303-44b2-9272-54a1af4dac10",
         "wait_seconds": "180",
     },
+    "dtc_order": {
+        "label": "quickbi DTC订单源",
+        "prefix": "BI_dtc_t01_trade_order_line",
+        "url": "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=04bdfcf3-c547-42a5-8a43-3a80264ff3d1&accessTicket=f9f48bad-12fa-4cbb-a663-d7d42c450c0a",
+        "wait_seconds": "240",
+    },
+    "dtc_refund": {
+        "label": "quickbi DTC退款成功退款源",
+        "prefix": "BI_dtc_t01_trade_refund_info_allsuc_filter",
+        "url": "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=b08a2190-66d7-4004-8ca0-9a6a92857dff&accessTicket=a3db8cff-4532-4f9b-a608-a0269d559bf6",
+        "wait_seconds": "180",
+    },
 }
 
 

@@ -177,6 +177,8 @@ def classify_failure(log_path: Path) -> list[str]:
         hints.append("检查阿里妈妈页面是否已在本机 Chrome 登录，或重跑 Step 2 的 auth 刷新。")
     if "QuickBI" in text and ("缺失" in text or "50" in text):
         hints.append("检查 Step 1 QuickBI 完整文件补充是否成功。")
+    if "BI_dtc_t01_trade_order_line" in text:
+        hints.append("DTC 订单源未生成当天文件；重试 QuickBI 抓取并确认页面数据接口可返回订单行。")
     if not hints:
         hints.append("查看对应 step 日志中的 [FAIL]/[ERROR]/[WARN] 行定位原因。")
     return hints

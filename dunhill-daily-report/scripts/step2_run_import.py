@@ -406,6 +406,11 @@ def check_required_quickbi_files(download_path, today_str, save_path=None):
     return len(missing) == 0, missing
 
 
+def quickbi_completion_gate(run_succeeded, files_ok, missing_files):
+    """只有子流程成功且当天必需 QuickBI 文件齐全时才允许 Step 2 成功。"""
+    return bool(run_succeeded and files_ok), list(missing_files)
+
+
 def run_taobao_login_interactive(data_import_dir):
     """
     Run the Taobao login helper, auto-selecting menu option 1.
@@ -1344,10 +1349,29 @@ def run_import_script(
         else:
             tracker.update_status('alimama', 'warning', '已按参数跳过阿里妈妈任务')
 
+        # Final required-file gate: a zero subprocess return code must not hide
+        # a missing QuickBI source or stale database import.
+        download_path = get_download_path()
+        today_str = date.today().strftime("%Y-%m-%d")
+        quickbi_files_ok, missing_quickbi = check_required_quickbi_files(
+            download_path,
+            today_str,
+        )
+        step_succeeded, missing_quickbi = quickbi_completion_gate(
+            run_succeeded=return_code == 0 and alimama_ok,
+            files_ok=quickbi_files_ok,
+            missing_files=missing_quickbi,
+        )
+        if not quickbi_files_ok:
+            print("\n[FAIL] 当天必需 QuickBI 文件不完整，Step 2 不得标记成功:")
+            for prefix in missing_quickbi:
+                print(f"       - {prefix}")
+            print("  [ACTION] 重试 QuickBI 抓取；仍失败时检查对应页面登录态和数据接口。")
+
         # Print final summary again
         tracker.print_summary()
 
-        return return_code == 0 and alimama_ok
+        return step_succeeded
 
     except Exception as e:
         print(f"[FAIL] 脚本执行错误: {str(e)}")
