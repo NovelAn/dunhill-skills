@@ -234,6 +234,13 @@ REQUIRED_QUICKBI_FILES = [
     "BI_dtc_t01_trade_order_line",
     "BI_dtc_t01_trade_refund_info_allsuc_filter",
 ]
+QUICKBI_PREFIX_TO_STEP1_SOURCE = {
+    "BI_tm_t01_trade_order_line": "tm_order",
+    "BI_tm_trade_refund_info_allsuc_filter": "tm_refund_success",
+    "BI_tm_trade_refund_info_paydate_filter": "tm_refund_pending",
+    "BI_dtc_t01_trade_order_line": "dtc_order",
+    "BI_dtc_t01_trade_refund_info_allsuc_filter": "dtc_refund",
+}
 
 STEP1_UPLOAD_PATTERNS = [
     ("退款源", ["[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9].xlsx"]),
@@ -248,6 +255,18 @@ STEP1_UPLOAD_PATTERNS = [
     ("经营参谋商品源", ["dunhill_product_d_recent_*.xlsx"]),
     ("经营参谋商品流量源", ["dunhill_product_traffic_d_recent_*.xlsx"]),
 ]
+STEP1_BACKUP_TARGETS = {
+    "直播大盘": "dunhill_直播取数源",
+    "直播场次": "dunhill_直播场次实时源",
+    "直播订单": "dunhill_直播订单源",
+    "TM订单补充": "dunhill_BI订单源",
+    "TM退款成功补充": "dunhill_TM退款源_hive",
+    "TM待退款补充": "dunhill_TM退款源_hive",
+    "经营参谋店铺源": "dunhill_tm取数源_backup",
+    "经营参谋流量源": "dunhill_tm流量源_new",
+    "经营参谋商品源": "dunhill_tm商品源",
+    "经营参谋商品流量源": "dunhill_tm商品流量源",
+}
 
 
 def get_download_path():
@@ -281,19 +300,52 @@ def file_mtime_is_today(path, day=None):
     return modified == day
 
 
-def find_step1_upload_residuals(download_path, day=None):
-    """
-    Return today's Step 1 raw-source files still left in Downloads.
+def is_empty_live_order_file(path):
+    """Return True when a live-order export has headers but no data rows."""
+    try:
+        import pandas as pd
 
-    Upload completion for this workflow is defined by these files being moved out
-    of Downloads into the data-import backup folders by file_uploader.
+        return pd.read_excel(path).dropna(how="all").empty
+    except Exception:
+        return False
+
+
+def backup_has_uploaded_source(label, patterns, save_path, day):
+    """Check backup for today's uploaded source instead of requiring Downloads cleanup."""
+    target = STEP1_BACKUP_TARGETS.get(label)
+    backup_dir = os.path.join(save_path, target) if target else save_path
+    if not os.path.isdir(backup_dir):
+        return False
+
+    tokens = set(date_tokens(day.isoformat()))
+    tokens.update(date_tokens((day - timedelta(days=1)).isoformat()))
+    for pattern in patterns:
+        for file_path in glob.glob(os.path.join(backup_dir, "**", pattern), recursive=True):
+            if not os.path.isfile(file_path):
+                continue
+            name = os.path.basename(file_path)
+            if file_mtime_is_today(file_path, day) or any(token in name for token in tokens):
+                return True
+    return False
+
+
+def find_step1_upload_residuals(download_path, day=None, save_path=None):
+    """
+    Return Step 1 sources that still need upload handling.
+
+    Completion is defined by today's source existing in data-import backup. An
+    empty live-order export in Downloads is a valid no-order day and needs no upload.
     """
     if day is None:
         day = date.today()
+    if save_path is None:
+        save_path = get_default_save_path()
 
     residuals = []
     seen = set()
     for label, patterns in STEP1_UPLOAD_PATTERNS:
+        if backup_has_uploaded_source(label, patterns, save_path, day):
+            continue
         for pattern in patterns:
             for file_path in glob.glob(os.path.join(download_path, pattern)):
                 if not os.path.isfile(file_path):
@@ -302,6 +354,9 @@ def find_step1_upload_residuals(download_path, day=None):
                     continue
                 key = os.path.abspath(file_path)
                 if key in seen:
+                    continue
+                if label == "直播订单" and is_empty_live_order_file(file_path):
+                    print(f"       [SKIP] 直播订单源为空，按正常无订单处理: {os.path.basename(file_path)}")
                     continue
                 seen.add(key)
                 residuals.append({
@@ -406,9 +461,20 @@ def check_required_quickbi_files(download_path, today_str, save_path=None):
     return len(missing) == 0, missing
 
 
-def quickbi_completion_gate(run_succeeded, files_ok, missing_files):
+def confirmed_zero_quickbi_sources(logs_dir):
+    """Return sources whose Step 1 preview explicitly confirmed zero rows."""
+    sources = set()
+    pattern = re.compile(r'"prefix"\s*:\s*"([^"]+)".*?"rows"\s*:\s*0(?:\D|$)')
+    for log_path in Path(logs_dir).glob("step1*.log"):
+        for match in pattern.finditer(log_path.read_text(encoding="utf-8", errors="replace")):
+            sources.add(match.group(1))
+    return sources
+
+
+def quickbi_completion_gate(run_succeeded, files_ok, missing_files, confirmed_zero_sources=()):
     """只有子流程成功且当天必需 QuickBI 文件齐全时才允许 Step 2 成功。"""
-    return bool(run_succeeded and files_ok), list(missing_files)
+    unresolved = [source for source in missing_files if source not in confirmed_zero_sources]
+    return bool(run_succeeded and (files_ok or not unresolved)), unresolved
 
 
 def run_taobao_login_interactive(data_import_dir):
@@ -764,6 +830,38 @@ def download_missing_jycm_files(missing_files, download_path, today_str, max_ret
     return still_missing
 
 
+def download_missing_quickbi_files(missing_files):
+    """Download only the missing QuickBI Step 1 sources, skipping refund and live exports."""
+    sources = [
+        QUICKBI_PREFIX_TO_STEP1_SOURCE[prefix]
+        for prefix in missing_files
+        if prefix in QUICKBI_PREFIX_TO_STEP1_SOURCE
+    ]
+    if not sources:
+        return list(missing_files)
+
+    root_dir = Path(__file__).resolve().parents[1]
+    command = [
+        sys.executable,
+        "-u",
+        str(root_dir / "scripts" / "step1_collect_data.py"),
+        "--skip-refund",
+        "--skip-live",
+        "--quickbi-sources",
+        *sources,
+    ]
+    print(f"\n  {'='*60}")
+    print(f"  补充下载缺失 QuickBI 源: {', '.join(sources)}")
+    print(f"  {'='*60}")
+    result = subprocess.run(command, cwd=str(root_dir))
+    if result.returncode != 0:
+        return list(missing_files)
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    _, still_missing = check_required_quickbi_files(get_download_path(), today_str)
+    return [prefix for prefix in still_missing if prefix in missing_files]
+
+
 def run_file_uploader(data_import_dir, timeout=900):
     """Run the file_uploader.py script to upload all files to database."""
     uploader_script = os.path.join(data_import_dir, 'src', 'data_pipeline', 'processors', 'file_uploader.py')
@@ -823,12 +921,12 @@ def drain_upload_residuals(data_import_dir, download_path, tracker, day=None, ma
     """
     residuals = find_step1_upload_residuals(download_path, day)
     if not residuals:
-        tracker.update_status('file_upload', 'completed', '原始文件已迁移出 Downloads')
-        print("\n  [OK] 所有原始数据文件已迁移出 Downloads，可视为上传完成")
+        tracker.update_status('file_upload', 'completed', 'backup 已有今天有效源，空直播订单无需上传')
+        print("\n  [OK] backup 已有今天有效源；空直播订单按无订单日处理，可视为上传完成")
         return True
 
-    tracker.update_status('file_upload', 'warning', f'发现 {len(residuals)} 个原始文件仍留在 Downloads')
-    print("\n  [WARN] 发现今天的原始数据文件仍留在 Downloads，执行文件上传直到清空...")
+    tracker.update_status('file_upload', 'warning', f'发现 {len(residuals)} 个源尚未进入 backup')
+    print("\n  [WARN] 发现今天仍有原始数据源未进入 backup，执行文件上传补偿...")
     print_upload_residuals(residuals)
 
     previous_key = residual_key(residuals)
@@ -839,20 +937,20 @@ def drain_upload_residuals(data_import_dir, download_path, tracker, day=None, ma
 
         residuals = find_step1_upload_residuals(download_path, day)
         if not residuals:
-            tracker.update_status('file_upload', 'completed', '残留原始文件已迁移到 backup')
-            print("       [OK] 文件上传完成，原始文件已迁移出 Downloads")
+            tracker.update_status('file_upload', 'completed', 'backup 已有今天有效源')
+            print("       [OK] 文件上传完成，backup 已有今天有效源")
             return True
 
         current_key = residual_key(residuals)
-        tracker.update_status('file_upload', 'warning', f'仍有 {len(residuals)} 个原始文件留在 Downloads')
-        print("       [WARN] 文件上传后仍有原始文件残留:")
+        tracker.update_status('file_upload', 'warning', f'仍有 {len(residuals)} 个源尚未进入 backup')
+        print("       [WARN] 文件上传后仍有源尚未进入 backup:")
         print_upload_residuals(residuals, prefix="              -")
         if current_key == previous_key:
             break
         previous_key = current_key
 
-    tracker.update_status('file_upload', 'failed', '文件上传后仍有原始文件残留')
-    print("       [FAIL] 文件上传后仍有原始文件残留，不能继续后置任务")
+    tracker.update_status('file_upload', 'failed', '文件上传后仍有源尚未进入 backup')
+    print("       [FAIL] 文件上传后仍有源尚未进入 backup，不能继续后置任务")
     print_upload_residuals(residuals, prefix="              -")
     tracker.print_summary()
     return False
@@ -1028,11 +1126,10 @@ def run_import_script(
                 tracker.update_status('fq_crawler', 'warning', '千牛 cookies 已过期，准备自动更新认证')
                 login_ok = run_taobao_login_mcp(data_import_dir)
                 if not login_ok:
-                    print("\n  [WARN] MCP 登录更新失败，回退到旧 Playwright 登录脚本...")
-                    login_ok = run_taobao_login_interactive(data_import_dir)
+                    print("\n[FAIL] MCP 登录更新失败；按要求不回退到旧 Playwright 登录脚本。")
                 if not login_ok:
-                    tracker.update_status('nick_crawler', 'failed', '千牛登录脚本执行失败')
-                    tracker.update_status('fq_crawler', 'failed', '千牛登录脚本执行失败')
+                    tracker.update_status('nick_crawler', 'failed', '千牛 MCP 登录脚本执行失败')
+                    tracker.update_status('fq_crawler', 'failed', '千牛 MCP 登录脚本执行失败')
                     tracker.print_summary()
                     os.chdir(original_dir)
                     return False
@@ -1239,6 +1336,7 @@ def run_import_script(
 
         tracker.print_summary()
         print(f"脚本返回码: {return_code}\n")
+        pipeline_succeeded = return_code == 0
 
         # ============================================================
         # 智能验证：只在 run.py 失败时才执行验证和补下载
@@ -1258,7 +1356,14 @@ def run_import_script(
             jycm_ok, missing_jycm = check_required_jycm_files(download_path, today_str)
             quickbi_ok, missing_quickbi = check_required_quickbi_files(download_path, today_str)
 
-            if jycm_ok and quickbi_ok:
+            confirmed_zero_sources = confirmed_zero_quickbi_sources(
+                Path(__file__).resolve().parents[1] / "runs" / today_str / "logs"
+            )
+            unresolved_quickbi = [
+                source for source in missing_quickbi if source not in confirmed_zero_sources
+            ]
+
+            if jycm_ok and not unresolved_quickbi:
                 tracker.update_status('file_verification', 'completed', '所有必需文件已存在')
                 print(f"       [OK] 所有必需文件已存在")
             else:
@@ -1268,9 +1373,9 @@ def run_import_script(
                         print(f"              - {prefix}")
                     tracker.update_status('file_verification', 'warning', f'缺失{len(missing_jycm)}个文件')
 
-                if missing_quickbi:
-                    print(f"       [WARN] 缺失 {len(missing_quickbi)} 个QuickBI文件:")
-                    for prefix in missing_quickbi:
+                if unresolved_quickbi:
+                    print(f"       [WARN] 缺失 {len(unresolved_quickbi)} 个QuickBI文件:")
+                    for prefix in unresolved_quickbi:
                         print(f"              - {prefix}")
 
                 # Auto-retry missing JYCM files
@@ -1283,16 +1388,30 @@ def run_import_script(
                     else:
                         tracker.update_status('jycm_retry', 'warning', f'{len(still_missing)}个文件仍缺失')
 
-                    # Re-run file uploader after retrying downloads, then verify Downloads is clean.
-                    print("\n  重新执行文件上传...")
-                    upload_success = drain_upload_residuals(data_import_dir, download_path, tracker, today)
+                    jycm_ok, _ = check_required_jycm_files(download_path, today_str)
 
-                    # Run follow-up tasks only after upload is actually complete.
-                    if upload_success:
-                        print("\n  执行后续任务...")
-                        followup_results = run_order_crawlers(data_import_dir)
-                        for task, success in followup_results.items():
-                            tracker.update_status(task, 'completed' if success else 'warning')
+                if unresolved_quickbi:
+                    tracker.update_status('quickbi', 'running', f'补充下载{len(unresolved_quickbi)}个缺失源')
+                    still_missing_quickbi = download_missing_quickbi_files(unresolved_quickbi)
+                    if not still_missing_quickbi:
+                        tracker.update_status('quickbi', 'completed', '缺失 QuickBI 源补充下载成功')
+                    else:
+                        tracker.update_status('quickbi', 'failed', f'{len(still_missing_quickbi)}个 QuickBI 源仍缺失')
+
+                    quickbi_ok, missing_quickbi = check_required_quickbi_files(download_path, today_str)
+                    unresolved_quickbi = [
+                        source for source in missing_quickbi if source not in confirmed_zero_sources
+                    ]
+
+            if jycm_ok and not unresolved_quickbi:
+                print("\n  重新执行文件上传...")
+                upload_success = drain_upload_residuals(data_import_dir, download_path, tracker, today)
+                if upload_success:
+                    print("\n  执行后续任务...")
+                    followup_results = run_order_crawlers(data_import_dir)
+                    for task, success in followup_results.items():
+                        tracker.update_status(task, 'completed' if success else 'failed')
+                    pipeline_succeeded = all(followup_results.values())
 
         elif auto_retry and return_code == 0:
             # run.py 已经完整执行了所有任务（下载→上传→爬虫→买家类型更新）
@@ -1312,7 +1431,8 @@ def run_import_script(
             print("\n  [>>] 执行后续任务（确保数据完整性）...")
             followup_results = run_order_crawlers(data_import_dir)
             for task, success in followup_results.items():
-                tracker.update_status(task, 'completed' if success else 'warning')
+                tracker.update_status(task, 'completed' if success else 'failed')
+            pipeline_succeeded = all(followup_results.values())
 
         # Check for QuickBI warnings
         if quickbi_warning_detected:
@@ -1357,12 +1477,18 @@ def run_import_script(
             download_path,
             today_str,
         )
+        confirmed_zero_sources = confirmed_zero_quickbi_sources(
+            Path(__file__).resolve().parents[1] / "runs" / today_str / "logs"
+        )
         step_succeeded, missing_quickbi = quickbi_completion_gate(
-            run_succeeded=return_code == 0 and alimama_ok,
+            run_succeeded=pipeline_succeeded and alimama_ok,
             files_ok=quickbi_files_ok,
             missing_files=missing_quickbi,
+            confirmed_zero_sources=confirmed_zero_sources,
         )
-        if not quickbi_files_ok:
+        if confirmed_zero_sources:
+            print(f"\n[OK] Step 1 已确认零行数据源: {', '.join(sorted(confirmed_zero_sources))}")
+        if missing_quickbi:
             print("\n[FAIL] 当天必需 QuickBI 文件不完整，Step 2 不得标记成功:")
             for prefix in missing_quickbi:
                 print(f"       - {prefix}")

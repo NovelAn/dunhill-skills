@@ -155,7 +155,8 @@ def resolve_playwright_mcp_command() -> list[str]:
 
     npx_path = shutil.which("npx")
     if npx_path:
-        return [npx_path, "-y", "@playwright/mcp@latest"]
+        cache_dir = os.environ.get("PLAYWRIGHT_MCP_NPX_CACHE", "/tmp/dunhill-playwright-mcp-npx")
+        return [npx_path, "--cache", cache_dir, "-y", "@playwright/mcp@latest"]
 
     raise MCPError(
         "Unable to locate Playwright MCP runtime. "
@@ -539,7 +540,15 @@ class PlaywrightMCPClient:
         self.proc = None
 
     def run_code(self, code: str, timeout: int | None = None) -> str:
-        result = self.call_tool("browser_run_code_unsafe", {"code": code}, timeout=timeout)
+        wrapped_code = f"""
+async (page) => {{
+  const userCode = ({code});
+  const result = await userCode(page);
+  await page.goto('about:blank', {{ waitUntil: 'domcontentloaded', timeout: 5000 }}).catch(() => null);
+  return result;
+}}
+"""
+        result = self.call_tool("browser_run_code_unsafe", {"code": wrapped_code}, timeout=timeout)
         return tool_text(result) or json.dumps(result, ensure_ascii=False, indent=2)
 
     def call_tool(self, name: str, arguments: dict[str, Any], timeout: int | None = None) -> dict[str, Any]:

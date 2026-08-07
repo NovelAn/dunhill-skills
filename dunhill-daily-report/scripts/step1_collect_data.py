@@ -29,6 +29,7 @@ def main() -> int:
     parser.add_argument("--skip-refund", action="store_true")
     parser.add_argument("--skip-live", action="store_true")
     parser.add_argument("--skip-quickbi", action="store_true")
+    parser.add_argument("--quickbi-sources", nargs="+")
     parser.add_argument("--timeout", type=int, default=420)
     args = parser.parse_args()
 
@@ -45,6 +46,9 @@ def main() -> int:
         command.append("--skip-live")
     if args.skip_quickbi:
         command.append("--skip-quickbi")
+    if args.quickbi_sources:
+        command.append("--quickbi-sources")
+        command.extend(args.quickbi_sources)
 
     print("Step 1 flow: Playwright Chrome Extension + MCP bridge")
     print("Refund/live/QuickBI exports run through high-speed scripts in the local Chrome login state.")

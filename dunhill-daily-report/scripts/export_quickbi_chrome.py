@@ -27,7 +27,8 @@ QUICKBI_SOURCES = {
         "prefix": "BI_tm_t01_trade_order_line",
         "url": "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=1065de5c-5f49-4086-9f3c-3451cb6d8444&accessTicket=b2b373ed-5eed-4aab-accf-2b9b3852994f",
         "wait_seconds": "360",
-        "force_export": True,
+        "page_load_timeout_ms": 120000,
+        "main_content_timeout_ms": 180000,
     },
     "tm_refund_success": {
         "label": "quickbi天猫退款成功退款源",
@@ -46,6 +47,8 @@ QUICKBI_SOURCES = {
         "prefix": "BI_dtc_t01_trade_order_line",
         "url": "https://bi.aliyuncs.com/token3rd/offline/view/pc.htm?pageId=04bdfcf3-c547-42a5-8a43-3a80264ff3d1&accessTicket=f9f48bad-12fa-4cbb-a663-d7d42c450c0a",
         "wait_seconds": "240",
+        "page_load_timeout_ms": 120000,
+        "main_content_timeout_ms": 180000,
     },
     "dtc_refund": {
         "label": "quickbi DTC退款成功退款源",
@@ -100,8 +103,10 @@ QUICKBI_BROWSER_HELPERS = r"""
   }
 
   async function waitForMainContent(source) {
-    await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null);
-    const deadline = Date.now() + 90000;
+    const pageLoadTimeout = Number(source.page_load_timeout_ms || 60000);
+    const mainContentTimeout = Number(source.main_content_timeout_ms || 90000);
+    await page.waitForLoadState('domcontentloaded', { timeout: pageLoadTimeout }).catch(() => null);
+    const deadline = Date.now() + mainContentTimeout;
     let last = '';
     while (Date.now() < deadline) {
       const state = await page.evaluate(() => {
@@ -497,7 +502,7 @@ QUICKBI_BROWSER_HELPERS = r"""
   }
 
   async function createTaskFlow(source) {
-    await page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: Number(source.page_load_timeout_ms || 60000) });
     await waitForMainContent(source);
     await clickQueryIfPresent();
     const rowInfo = await getPreviewRowCount(source);
@@ -541,9 +546,9 @@ QUICKBI_BROWSER_HELPERS = r"""
   }
 
   async function downloadLatestTaskFlow(source) {
-    await page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: Number(source.page_load_timeout_ms || 60000) });
     await waitForMainContent(source);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: Number(source.page_load_timeout_ms || 60000) }).catch(() => null);
     await waitForMainContent(source);
     await openTaskList(source);
     const clicked = await inspectReadyDownload(source, true);

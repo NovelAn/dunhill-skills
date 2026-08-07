@@ -8,6 +8,8 @@ scripts while reusing the user's local Chrome login state.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +17,21 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 ROOT_DIR = SCRIPT_DIR.parent
+QUICKBI_SOURCE_KEYS = ["tm_order", "tm_refund_success", "tm_refund_pending", "dtc_order", "dtc_refund"]
+
+
+def record_task(name: str, status: str) -> None:
+    path_text = os.environ.get("DUNHILL_STEP1_TASK_STATE")
+    if not path_text:
+        return
+    path = Path(path_text)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except json.JSONDecodeError:
+        state = {}
+    state[name] = status
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def run_script(args: list[str]) -> bool:
@@ -39,8 +56,10 @@ def main() -> int:
         action="store_true",
         help="Skip QuickBI full-export supplement for TM order/refund sources",
     )
+    parser.add_argument("--quickbi-sources", nargs="+", choices=QUICKBI_SOURCE_KEYS)
     parser.add_argument("--timeout", type=int, default=420)
     args = parser.parse_args()
+    failed: list[str] = []
 
     if not args.skip_refund:
         refund_cmd = [
@@ -52,9 +71,12 @@ def main() -> int:
         ]
         if args.refund_attach_current:
             refund_cmd.append("--attach-current")
-        if not run_script(refund_cmd):
+        if run_script(refund_cmd):
+            record_task("refund", "success")
+        else:
+            record_task("refund", "failed")
             print("[FAIL] Refund export failed")
-            return 1
+            failed.append("refund")
 
     if not args.skip_live:
         live_cmd = [
@@ -64,24 +86,35 @@ def main() -> int:
             "--timeout",
             str(args.timeout),
         ]
-        if not run_script(live_cmd):
+        if run_script(live_cmd):
+            record_task("live", "success")
+        else:
+            record_task("live", "failed")
             print("[FAIL] Live export failed")
-            return 1
+            failed.append("live")
 
     if not args.skip_quickbi:
-        quickbi_cmd = [
-            sys.executable,
-            "-u",
-            str(SCRIPT_DIR / "export_quickbi_chrome.py"),
-            "--sources",
-            "all",
-            "--timeout",
-            str(args.timeout),
-        ]
-        if not run_script(quickbi_cmd):
-            print("[FAIL] QuickBI supplement export failed")
-            return 1
+        quickbi_sources = args.quickbi_sources or QUICKBI_SOURCE_KEYS
+        for source in quickbi_sources:
+            quickbi_cmd = [
+                sys.executable,
+                "-u",
+                str(SCRIPT_DIR / "export_quickbi_chrome.py"),
+                "--sources",
+                source,
+                "--timeout",
+                str(args.timeout),
+            ]
+            if run_script(quickbi_cmd):
+                record_task(f"quickbi:{source}", "success")
+            else:
+                record_task(f"quickbi:{source}", "failed")
+                print(f"[FAIL] QuickBI supplement export failed: {source}")
+                failed.append(f"quickbi:{source}")
 
+    if failed:
+        print("\n[FAIL] Step 1 failed tasks: " + ", ".join(failed))
+        return 1
     print("\n[OK] Step 1 Chrome bridge exports completed")
     return 0
 

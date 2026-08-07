@@ -128,9 +128,34 @@ async (page) => {{
 
   async function clickButtonExact(text, targetPage = page, timeout = 30000) {{
     const locator = targetPage.locator('button').filter({{ hasText: exactTextRegex(text) }}).first();
-    await locator.waitFor({{ state: 'visible', timeout }});
-    await locator.click({{ timeout }});
-    return {{ ok: true, text }};
+    await locator.waitFor({{ state: 'visible', timeout: Math.min(timeout, 30000) }});
+    try {{
+      await locator.click({{ timeout: Math.min(timeout, 15000) }});
+      return {{ ok: true, text, via: 'locator' }};
+    }} catch (err) {{
+      // 回退：按钮可点击但被浮层遮挡时，Playwright actionability(receives-events) 会失败。
+      // 直接在 DOM 上触发 click()，绕过鼠标坐标命中检测（refund 页搜索/选状态一直用这方式）。
+      const diag = await targetPage.evaluate((needle) => {{
+        const norm = t => String(t || '').replace(/\\s+/g, '').trim();
+        const target = norm(needle);
+        const btn = [...document.querySelectorAll('button')]
+          .filter(b => b.offsetParent !== null)
+          .find(b => norm(b.textContent) === target);
+        if (!btn) return {{ clicked: false, reason: 'not-found' }};
+        const disabled = btn.disabled
+          || btn.classList.contains('disabled')
+          || btn.classList.contains('next-btn-disabled')
+          || btn.getAttribute('aria-disabled') === 'true';
+        if (disabled) return {{ clicked: false, reason: 'disabled', classList: btn.className }};
+        btn.click();
+        return {{ clicked: true, classList: btn.className }};
+      }}, text).catch(() => null);
+      if (!diag || !diag.clicked) {{
+        const errLine = err && err.message ? err.message.split('\\n')[0] : String(err);
+        throw new Error(`clickButtonExact(${{JSON.stringify(text)}}) failed: ${{errLine}} | fallback diag: ${{JSON.stringify(diag)}}`);
+      }}
+      return {{ ok: true, text, via: 'dom-click-fallback' }};
+    }}
   }}
 
   async function hasVisibleButton(text, targetPage = page, timeout = 10000) {{

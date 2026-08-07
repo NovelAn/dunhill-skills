@@ -101,7 +101,7 @@ settings:
 notifications:
   lark:
     enabled: true
-    send_identity: "user"
+    send_identity: "bot"
     chat_name: "数据更新提醒"
     chat_id: "oc_2713a524be31fe0092cbfe94533407ac"
     mention_members:

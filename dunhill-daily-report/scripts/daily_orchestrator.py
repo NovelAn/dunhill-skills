@@ -25,6 +25,7 @@ SCRIPT_DIR = ROOT_DIR / "scripts"
 RUNS_DIR = ROOT_DIR / "runs"
 CONFIG_PATH = ROOT_DIR / "config" / "dunhill-config.yaml"
 STEPS = ["step1", "step2"]
+QUICKBI_SOURCE_KEYS = ["tm_order", "tm_refund_success", "tm_refund_pending", "dtc_order", "dtc_refund"]
 RETRYABLE_FAILURE_MARKERS = (
     "timed out",
     "timeout",
@@ -38,6 +39,12 @@ RETRYABLE_FAILURE_MARKERS = (
     "connection refused",
     "econnreset",
     "net::err",
+)
+NON_RETRYABLE_FAILURE_MARKERS = (
+    "文件上传后仍有原始文件残留",
+    "文件上传后仍有源尚未进入 backup",
+    "不能继续后置任务",
+    "当天必需 quickbi 文件不完整",
 )
 
 
@@ -151,9 +158,25 @@ def selected_steps(args: argparse.Namespace) -> list[str]:
     return steps
 
 
-def step_command(step: str, args: argparse.Namespace) -> list[str]:
+def step_command(step: str, args: argparse.Namespace, state: dict | None = None) -> list[str]:
     if step == "step1":
-        return [sys.executable, "-u", str(SCRIPT_DIR / "step1_collect_data.py")]
+        command = [sys.executable, "-u", str(SCRIPT_DIR / "step1_collect_data.py")]
+        task_state = {} if args.force else (state or {}).get("step1_tasks", {})
+        if task_state.get("refund") == "success":
+            command.append("--skip-refund")
+        if task_state.get("live") == "success":
+            command.append("--skip-live")
+        failed_quickbi = [
+            key
+            for key in QUICKBI_SOURCE_KEYS
+            if task_state and task_state.get(f"quickbi:{key}") != "success"
+        ]
+        if task_state and not failed_quickbi:
+            command.append("--skip-quickbi")
+        elif failed_quickbi:
+            command.append("--quickbi-sources")
+            command.extend(failed_quickbi)
+        return command
     if step == "step2":
         command = [sys.executable, "-u", str(SCRIPT_DIR / "step2_run_import.py")]
         if args.refresh_alimama_auth_first:
@@ -207,6 +230,8 @@ def is_retryable_failure(log_path: Path) -> bool:
     if not log_path.exists():
         return True
     text = log_path.read_text(encoding="utf-8", errors="replace").lower()
+    if any(marker in text for marker in NON_RETRYABLE_FAILURE_MARKERS):
+        return False
     return any(marker in text for marker in RETRYABLE_FAILURE_MARKERS)
 
 
@@ -271,9 +296,13 @@ def run_step(
     process: subprocess.Popen | None = None
     try:
         with log_path.open("w", encoding="utf-8") as log_file:
+            env = os.environ.copy()
+            if step == "step1":
+                env["DUNHILL_STEP1_TASK_STATE"] = str(run_dir / "step1_tasks.json")
             process = subprocess.Popen(
                 command,
                 cwd=str(ROOT_DIR),
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -326,6 +355,10 @@ def run_step(
         print(f"\n[FAIL] {step} failed with exit code {exit_code}")
         for hint in step_state["needs_action"]:
             print(f"  - {hint}")
+    if step == "step1":
+        task_state_path = run_dir / "step1_tasks.json"
+        if task_state_path.exists():
+            state["step1_tasks"] = json.loads(task_state_path.read_text(encoding="utf-8"))
 
     save_state(run_dir / "state.json", state)
     return exit_code == 0
@@ -573,6 +606,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print and record steps without executing")
     parser.add_argument("--step-retries", type=int, default=1,
                         help="Retry each failed step this many times for transient browser/MCP failures")
+    parser.add_argument("--completion-rounds", type=int, default=3,
+                        help="Run Step 1-2 completion passes until both succeed; default: 3")
     parser.add_argument("--no-caffeinate", action="store_true", help="Do not wrap the run with macOS caffeinate")
     parser.add_argument("--refresh-alimama-auth-first", action="store_true", default=True,
                         help="Refresh Alimama auth before Step 2; enabled by default")
@@ -596,22 +631,39 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Run directory: {run_dir}")
     print(f"Selected steps: {', '.join(steps)}")
 
-    ok = True
-    for step in steps:
-        previous = state.get("steps", {}).get(step, {})
-        if previous.get("status") == "success" and not args.force:
-            print(f"[SKIP] {step} already succeeded. Use --force to re-run.")
-            continue
-        if not run_step_with_retries(
-            step,
-            step_command(step, args),
-            run_dir,
-            state,
-            args.dry_run,
-            args.step_retries,
-        ):
-            ok = False
+    max_rounds = max(1, args.completion_rounds) if steps == STEPS else 1
+    ok = False
+    for round_index in range(1, max_rounds + 1):
+        if max_rounds > 1:
+            print(f"\n[ROUND] Step 1-2 completion pass {round_index}/{max_rounds}")
+        round_ok = True
+        step1_ran_this_round = False
+        for step in steps:
+            previous = state.get("steps", {}).get(step, {})
+            rerun_step2 = step == "step2" and step1_ran_this_round
+            if previous.get("status") == "success" and not args.force and not rerun_step2:
+                print(f"[SKIP] {step} already succeeded. Use --force to re-run.")
+                continue
+            success = run_step_with_retries(
+                step,
+                step_command(step, args, state),
+                run_dir,
+                state,
+                args.dry_run,
+                0 if steps == STEPS and step == "step1" else args.step_retries,
+            )
+            if step == "step1":
+                step1_ran_this_round = True
+            if not success:
+                round_ok = False
+                continue
+        ok = round_ok
+        if ok:
             break
+        if round_index < max_rounds:
+            print("[RETRY] Step 1-2 not complete; retrying failed Step 1 work, then rerunning Step 2.")
+
+    state["completion_rounds_used"] = round_index
 
     state["status"] = "success" if ok else "failed"
     state["ended_at"] = now_iso()

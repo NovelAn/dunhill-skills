@@ -7,11 +7,21 @@ from scripts.export_quickbi_chrome import QUICKBI_SOURCES, quickbi_action_code
 
 
 class QuickBIMcpRoutingTests(unittest.TestCase):
+    def test_tm_order_uses_threshold_based_mcp_export(self):
+        source = QUICKBI_SOURCES["tm_order"]
+
+        self.assertEqual(source["prefix"], "BI_tm_t01_trade_order_line")
+        self.assertFalse(source.get("force_export", False))
+        self.assertEqual(source["page_load_timeout_ms"], 120000)
+        self.assertEqual(source["main_content_timeout_ms"], 180000)
+
     def test_dtc_order_uses_threshold_based_mcp_export(self):
         source = QUICKBI_SOURCES["dtc_order"]
 
         self.assertEqual(source["prefix"], "BI_dtc_t01_trade_order_line")
         self.assertFalse(source.get("force_export", False))
+        self.assertEqual(source["page_load_timeout_ms"], 120000)
+        self.assertEqual(source["main_content_timeout_ms"], 180000)
         self.assertIn("04bdfcf3-c547-42a5-8a43-3a80264ff3d1", source["url"])
 
     def test_dtc_refund_uses_threshold_based_mcp_export(self):
