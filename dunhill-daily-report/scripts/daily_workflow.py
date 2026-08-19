@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from scripts.workflow_dag import DagRunner, TaskResult, TaskSpec, atomic_write_json
+from scripts.workflow_tasks import run_step1_task
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -34,6 +35,14 @@ def _blocked_runner(task_id: str) -> Callable:
     return run
 
 
+def _step1_runner(task_id: str) -> Callable:
+    def run(_context):
+        download_dir = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "Downloads")))
+        return run_step1_task(task_id, ROOT_DIR, download_dir)
+
+    return run
+
+
 def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
     runner = _test_runner if test_mode else _blocked_runner
     specs: dict[str, TaskSpec] = {}
@@ -43,7 +52,8 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         "live_export",
         *(f"quickbi_browser.{source}" for source in QUICKBI_SOURCES),
     ):
-        specs[task_id] = TaskSpec(task_id, resources=("chrome_mcp", "browser_downloads"), runner=runner(task_id))
+        task_runner = runner(task_id) if test_mode else _step1_runner(task_id)
+        specs[task_id] = TaskSpec(task_id, resources=("chrome_mcp", "browser_downloads"), runner=task_runner)
 
     specs["taobao_auth_check"] = TaskSpec("taobao_auth_check", resources=("chrome_mcp",), runner=runner("taobao_auth_check"))
     for report_id in JYCM_REPORTS:
