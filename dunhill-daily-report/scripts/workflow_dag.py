@@ -76,6 +76,7 @@ class TaskSpec:
     resources: tuple[str, ...] = ()
     runner: Callable[["TaskContext"], TaskResult] | None = None
     contract_version: str = "v1"
+    inputs: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,8 @@ class DagRunner:
             dependency: state.get("tasks", {}).get(dependency, {}).get("outputs", [])
             for dependency in spec.deps
         }
+        if spec.inputs is not None:
+            upstream["inputs"] = spec.inputs(state)
         return fingerprint_inputs(
             state.get("run_date", datetime.now().strftime("%Y-%m-%d")),
             spec.contract_version,
@@ -215,6 +218,13 @@ class DagRunner:
                     result = future.result()
                     result.input_fingerprint = self._fingerprint(self.specs[task_id], state)
                     state["tasks"][task_id] = asdict(result)
+                    for descendant in self._descendants(task_id):
+                        receipt = state["tasks"].get(descendant, {})
+                        if receipt.get("status") in {"success", "no_data"}:
+                            current = self._fingerprint(self.specs[descendant], state)
+                            if receipt.get("input_fingerprint") != current:
+                                state["tasks"][descendant] = {"status": "pending"}
+                                pending.add(descendant)
                     self._save_state(state)
 
         statuses = [receipt.get("status") for receipt in state["tasks"].values() if receipt.get("status") in TERMINAL_STATUSES]
@@ -231,4 +241,3 @@ class DagRunner:
             state["tasks"].pop(candidate, None)
         self._save_state(state)
         return self.run(selected=selected)
-

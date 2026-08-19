@@ -74,6 +74,47 @@ class WorkflowDagTests(unittest.TestCase):
             DagRunner(specs, Path(directory) / "state.json", max_workers=2).run()
             self.assertEqual(maximum, 1)
 
+    def test_changed_upstream_output_invalidates_successful_descendant(self):
+        with TemporaryDirectory() as directory:
+            output = {"value": "a"}
+            specs = {
+                "a": TaskSpec(
+                    "a",
+                    runner=lambda _: TaskResult.success("a", outputs=[output["value"]]),
+                    inputs=lambda _: {"source": output["value"]},
+                ),
+                "b": TaskSpec(
+                    "b",
+                    deps=("a",),
+                    runner=lambda context: TaskResult.success(
+                        "b", evidence={"upstream": context.state["tasks"]["a"]["outputs"]}
+                    ),
+                ),
+            }
+            path = Path(directory) / "state.json"
+            runner = DagRunner(specs, path)
+            runner.run()
+            output["value"] = "b"
+            state = runner.run()
+            self.assertEqual(state["tasks"]["a"]["outputs"], ["b"])
+            self.assertEqual(state["tasks"]["b"]["evidence"]["upstream"], ["b"])
+
+    def test_no_data_is_terminal_and_reusable(self):
+        with TemporaryDirectory() as directory:
+            calls = []
+            specs = {
+                "empty_source": TaskSpec(
+                    "empty_source",
+                    runner=lambda _: calls.append("run") or TaskResult.no_data(
+                        "empty_source", evidence={"rows": 0, "confirmed_by": "source"}
+                    ),
+                )
+            }
+            runner = DagRunner(specs, Path(directory) / "state.json")
+            runner.run()
+            runner.run()
+            self.assertEqual(calls, ["run"])
+
 
 if __name__ == "__main__":
     unittest.main()
