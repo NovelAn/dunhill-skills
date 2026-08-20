@@ -1,5 +1,8 @@
 import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +11,14 @@ import scripts.daily_orchestrator as orchestrator
 
 
 class DailyOrchestratorTests(unittest.TestCase):
+    def test_weekend_skips_lark_notification(self):
+        config = {"notifications": {"lark": {"enabled": True, "chat_id": "oc_x"}}}
+        with patch("scripts.daily_orchestrator.datetime") as dt:
+            dt.now.return_value = datetime(2026, 8, 22)  # Saturday
+            notification = orchestrator.send_lark_success_notification(config, {}, Path("."), dry_run=True)
+        self.assertTrue(notification["skipped"])
+        self.assertEqual(notification["reason"], "weekend")
+
     def test_legacy_success_without_current_contract_is_not_reused(self):
         self.assertFalse(orchestrator.step_success_is_current({"status": "success"}))
 

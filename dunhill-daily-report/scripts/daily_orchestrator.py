@@ -536,6 +536,10 @@ def send_lark_success_notification(config: dict, state: dict, run_dir: Path, dry
         "dry_run": bool(dry_run),
         "sent_at": now_iso(),
     }
+    if datetime.now().weekday() >= 5:
+        print("[INFO] Lark notification skipped: weekend.")
+        notification.update({"lark_success": True, "skipped": True, "reason": "weekend"})
+        return notification
     if not lark_config.get("enabled", False):
         print("[INFO] Lark notification is disabled.")
         notification.update({"lark_success": True, "skipped": True, "reason": "disabled"})
