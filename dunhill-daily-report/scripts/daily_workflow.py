@@ -7,12 +7,17 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.workflow_dag import DagRunner, TaskResult, TaskSpec, atomic_write_json
 from scripts.workflow_tasks import run_step1_task, run_step2_task
+from scripts.daily_orchestrator import load_config, send_lark_success_notification, write_summary
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -120,6 +125,60 @@ def current_run_dir() -> Path:
     return Path(os.environ.get("DUNHILL_RUN_DIR", str(RUNS_DIR / datetime.now().strftime("%Y-%m-%d"))))
 
 
+def _task_step(task_id: str) -> str:
+    if task_id in {"refund_export", "live_export"} or task_id.startswith("quickbi_browser."):
+        return "step1"
+    return "step2"
+
+
+def _step_state(state: dict, step: str) -> dict:
+    task_ids = [task_id for task_id in state.get("tasks", {}) if _task_step(task_id) == step]
+    statuses = [state["tasks"][task_id].get("status") for task_id in task_ids]
+    failed = [task_id for task_id in task_ids if state["tasks"][task_id].get("status") in {"failed", "blocked"}]
+    if failed:
+        return {
+            "status": "failed",
+            "needs_action": [f"{task_id}: {state['tasks'][task_id].get('error_type', 'failed')}" for task_id in failed],
+        }
+    if any(status not in {"success", "no_data", "skipped"} for status in statuses):
+        return {"status": "running", "needs_action": []}
+    return {"status": "success", "needs_action": []}
+
+
+def workflow_complete(state: dict) -> bool:
+    statuses = [receipt.get("status") for receipt in state.get("tasks", {}).values()]
+    return bool(statuses) and all(status in {"success", "no_data", "skipped"} for status in statuses)
+
+
+def sync_legacy_state(state: dict) -> dict:
+    """Write orchestrator-compatible fields so report_daily_status keeps working."""
+    state["run_date"] = state.get("run_date") or current_run_dir().name
+    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    state["steps"] = {step: _step_state(state, step) for step in ("step1", "step2")}
+    state["needs_action"] = sorted({hint for step in state["steps"].values() for hint in step.get("needs_action", [])})
+    return state
+
+
+STATUS_ICONS = {"success": "OK ", "no_data": "0  ", "failed": "FAIL", "blocked": "BLK ", "running": "RUN ", "skipped": "SKIP", "pending": ".  "}
+
+
+def render_progress(state: dict) -> str:
+    specs = build_task_specs(test_mode=True)
+    lines = [f"Dunhill Step 1-2 DAG | run_date={state.get('run_date', '-')} | status={state.get('status', '-')}"]
+    for step in ("step1", "step2"):
+        lines.append("")
+        lines.append(f"[{step}]")
+        for task_id in specs:
+            if _task_step(task_id) != step:
+                continue
+            receipt = state.get("tasks", {}).get(task_id, {})
+            status = receipt.get("status", "pending")
+            icon = STATUS_ICONS.get(status, "?   ")
+            detail = receipt.get("error_type") or ""
+            lines.append(f"  {icon} {task_id:<45} {detail}")
+    return "\n".join(lines)
+
+
 def status() -> int:
     run_dir = current_run_dir()
     state_path = run_dir / "state.json"
@@ -135,9 +194,69 @@ def status() -> int:
     return 0
 
 
-def legacy_run(args: list[str]) -> int:
+def watch(once: bool = False) -> int:
+    state_path = current_run_dir() / "state.json"
+    while True:
+        if not state_path.exists():
+            print(f"state not found: {state_path}")
+            if once:
+                return 0
+            time.sleep(2)
+            continue
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {"status": "invalid_state"}
+        body = render_progress(state)
+        if once:
+            print(body)
+            return 0
+        print("\033[2J\033[H" + body + "\n(refresh 2s, ctrl-c to quit)")
+        if state.get("status") in {"success", "failed"}:
+            return 0
+        time.sleep(2)
+
+
+def legacy_run(args: list[str] | None = None) -> int:
     command = [sys.executable, "-u", str(ROOT_DIR / "scripts" / "daily_orchestrator.py"), *args]
     return subprocess.run(command, cwd=str(ROOT_DIR)).returncode
+
+
+def _failed_with_descendants(state: dict, specs: dict[str, TaskSpec]) -> set[str]:
+    selected = {task_id for task_id, receipt in state.get("tasks", {}).items() if receipt.get("status") == "failed"}
+    changed = True
+    while changed:
+        changed = False
+        for task_id, spec in specs.items():
+            if task_id not in selected and any(dep in selected for dep in spec.deps):
+                selected.add(task_id)
+                changed = True
+    return selected
+
+
+def run_workflow(selected: set[str] | None = None) -> int:
+    run_dir = current_run_dir()
+    state_path = run_dir / "state.json"
+    specs = build_task_specs(test_mode=False)
+    if selected is None and state_path.exists():
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+            selected = _failed_with_descendants(previous, specs) or None
+        except (OSError, json.JSONDecodeError):
+            pass
+    state = DagRunner(specs, state_path).run(selected=selected)
+    state = sync_legacy_state(state)
+    atomic_write_json(state_path, state)
+    write_summary(run_dir, state)
+    if workflow_complete(state) and state.get("status") == "success":
+        state["notification"] = send_lark_success_notification(load_config(), state, run_dir, dry_run=False)
+    else:
+        state["notification"] = None
+    atomic_write_json(state_path, state)
+    write_summary(run_dir, state)
+    print("\n" + "=" * 70)
+    print(render_progress(state))
+    return 0 if state.get("status") == "success" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -146,20 +265,38 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("status")
     subparsers.add_parser("run")
     subparsers.add_parser("resume")
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("--once", action="store_true")
     retry = subparsers.add_parser("retry")
     retry.add_argument("task_id")
     subparsers.add_parser("retry-failed")
+    subparsers.add_parser("legacy")
     args = parser.parse_args(argv)
 
     if args.command == "status":
         return status()
+    if args.command == "watch":
+        return watch(once=args.once)
     if os.environ.get("DUNHILL_WORKFLOW_TEST_MODE") == "1":
         state_path = current_run_dir() / "state.json"
         state = DagRunner(build_task_specs(test_mode=True), state_path).run()
+        state = sync_legacy_state(state)
         atomic_write_json(state_path, state)
         return 0
-    # ponytail: keep one safe migration fallback until all real task adapters have parity.
-    return legacy_run([])
+    if args.command == "run":
+        return run_workflow()
+    if args.command == "resume":
+        return run_workflow()
+    if args.command == "retry":
+        return run_workflow(selected={args.task_id})
+    if args.command == "retry-failed":
+        state_path = current_run_dir() / "state.json"
+        specs = build_task_specs(test_mode=False)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        return run_workflow(selected=_failed_with_descendants(state, specs))
+    if args.command == "legacy":
+        return legacy_run([])
+    return 1
 
 
 if __name__ == "__main__":

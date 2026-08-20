@@ -200,6 +200,9 @@ class DagRunner:
                     if self._ready(task_id, state, selected):
                         receipt = state["tasks"].get(task_id, {})
                         attempt = int(receipt.get("attempt", 0)) + 1
+                        state["tasks"][task_id] = {"status": "running", "attempt": attempt}
+                        self._save_state(state)
+                        print(f"[RUN] {task_id} (attempt {attempt})", flush=True)
                         pending.remove(task_id)
                         futures[pool.submit(self._run_one, self.specs[task_id], dict(state), attempt)] = task_id
 
@@ -225,6 +228,8 @@ class DagRunner:
                             if receipt.get("input_fingerprint") != current:
                                 state["tasks"][descendant] = {"status": "pending"}
                                 pending.add(descendant)
+                    detail = f" ({result.error_type})" if result.error_type else ""
+                    print(f"[{result.status.upper()}] {task_id}{detail}", flush=True)
                     self._save_state(state)
 
         statuses = [receipt.get("status") for receipt in state["tasks"].values() if receipt.get("status") in TERMINAL_STATUSES]

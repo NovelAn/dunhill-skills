@@ -38,7 +38,7 @@ class LaunchAgentTests(unittest.TestCase):
         self.assertIn('/usr/bin/lockf -t 0 "$LOCK_FILE" "$0"', runner)
         self.assertIn("lock_exit -eq 75", runner)
         self.assertIn('PYTHON_BIN="/Users/novel/Projects/data-import/.venv/bin/python"', runner)
-        self.assertIn('"$PYTHON_BIN" -u scripts/daily_orchestrator.py', runner)
+        self.assertIn('"$PYTHON_BIN" -u scripts/daily_workflow.py run', runner)
         self.assertNotIn("step3", runner.lower())
         self.assertNotIn("step4", runner.lower())
         self.assertNotIn("step5", runner.lower())

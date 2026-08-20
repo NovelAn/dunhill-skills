@@ -32,7 +32,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "Python runtime is unavailable:" "$PYTHON_BIN" >> "$RUNNER_LOG"
   exit 127
 fi
-"$PYTHON_BIN" -u scripts/daily_orchestrator.py
+"$PYTHON_BIN" -u scripts/daily_workflow.py run
 exit_code=$?
 printf '%s %s %d\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "LaunchAgent run exited with code" "$exit_code" >> "$RUNNER_LOG"
 exit "$exit_code"
