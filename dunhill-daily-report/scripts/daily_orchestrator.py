@@ -25,6 +25,7 @@ SCRIPT_DIR = ROOT_DIR / "scripts"
 RUNS_DIR = ROOT_DIR / "runs"
 CONFIG_PATH = ROOT_DIR / "config" / "dunhill-config.yaml"
 STEPS = ["step1", "step2"]
+SUCCESS_CONTRACT_VERSION = 2
 QUICKBI_SOURCE_KEYS = ["tm_order", "tm_refund_success", "tm_refund_pending", "dtc_order", "dtc_refund"]
 RETRYABLE_FAILURE_MARKERS = (
     "timed out",
@@ -156,6 +157,17 @@ def selected_steps(args: argparse.Namespace) -> list[str]:
         steps = ordered
 
     return steps
+
+
+def step_success_is_current(step_state: dict) -> bool:
+    return (
+        step_state.get("status") == "success"
+        and step_state.get("validation_contract") == SUCCESS_CONTRACT_VERSION
+    )
+
+
+def workflow_ready_for_notification(state: dict) -> bool:
+    return all(step_success_is_current(state.get("steps", {}).get(step, {})) for step in STEPS)
 
 
 def step_command(step: str, args: argparse.Namespace, state: dict | None = None) -> list[str]:
@@ -346,6 +358,7 @@ def run_step(
     attempt_state.update(updates)
     if exit_code == 0:
         step_state["status"] = "success"
+        step_state["validation_contract"] = SUCCESS_CONTRACT_VERSION
         attempt_state["status"] = "success"
         print(f"\n[OK] {step} completed in {duration}s")
     else:
@@ -624,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = run_dir / "state.json"
     state = load_state(state_path, args.date)
     state["status"] = "running"
+    state.pop("notification", None)
     save_state(state_path, state)
 
     steps = selected_steps(args)
@@ -641,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         for step in steps:
             previous = state.get("steps", {}).get(step, {})
             rerun_step2 = step == "step2" and step1_ran_this_round
-            if previous.get("status") == "success" and not args.force and not rerun_step2:
+            if step_success_is_current(previous) and not args.force and not rerun_step2:
                 print(f"[SKIP] {step} already succeeded. Use --force to re-run.")
                 continue
             success = run_step_with_retries(
@@ -665,13 +679,15 @@ def main(argv: list[str] | None = None) -> int:
 
     state["completion_rounds_used"] = round_index
 
-    state["status"] = "success" if ok else "failed"
+    workflow_complete = ok and workflow_ready_for_notification(state)
+    state["status"] = "success" if workflow_complete else ("partial" if ok else "failed")
     state["ended_at"] = now_iso()
     save_state(state_path, state)
     write_summary(run_dir, state)
 
     notify_ok = True
-    if ok and not args.no_notify:
+    notification_ready = workflow_complete
+    if ok and notification_ready and not args.no_notify:
         notification = send_lark_success_notification(
             config,
             state,
@@ -682,13 +698,24 @@ def main(argv: list[str] | None = None) -> int:
         state["notification"] = notification
         save_state(state_path, state)
         write_summary(run_dir, state)
-    elif ok and args.no_notify:
+    elif ok and notification_ready and args.no_notify:
         state["notification"] = {
             "lark_success": True,
             "identity": None,
             "dry_run": False,
             "skipped": True,
             "reason": "--no-notify",
+            "sent_at": now_iso(),
+        }
+        save_state(state_path, state)
+        write_summary(run_dir, state)
+    elif ok:
+        state["notification"] = {
+            "lark_success": False,
+            "identity": None,
+            "dry_run": False,
+            "skipped": True,
+            "reason": "Step 1-2 current validation contract is incomplete",
             "sent_at": now_iso(),
         }
         save_state(state_path, state)
@@ -700,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Summary: {run_dir / 'summary.md'}")
     if ok and not notify_ok:
         print("[WARN] Data update succeeded, but Lark notification failed. Check state.notification.")
-    if ok:
+    if workflow_complete:
         print("Mac Step 1-2 finished. Stop here unless Windows Excel Step 3-5 outputs already exist.")
     print("=" * 70)
     return 0 if ok else 1

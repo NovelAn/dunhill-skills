@@ -8,6 +8,19 @@ import scripts.daily_orchestrator as orchestrator
 
 
 class DailyOrchestratorTests(unittest.TestCase):
+    def test_legacy_success_without_current_contract_is_not_reused(self):
+        self.assertFalse(orchestrator.step_success_is_current({"status": "success"}))
+
+    def test_notification_requires_both_steps_on_current_contract(self):
+        current = {
+            "status": "success",
+            "validation_contract": orchestrator.SUCCESS_CONTRACT_VERSION,
+        }
+        state = {"steps": {"step1": current, "step2": current}}
+
+        self.assertTrue(orchestrator.workflow_ready_for_notification(state))
+        self.assertFalse(orchestrator.workflow_ready_for_notification({"steps": {"step1": current}}))
+
     def test_step1_retry_command_only_runs_failed_subtasks(self):
         args = Namespace(force=False)
         state = {

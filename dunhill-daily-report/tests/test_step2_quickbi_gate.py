@@ -1,12 +1,107 @@
+import os
 import tempfile
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 
 from scripts.daily_orchestrator import classify_failure
-from scripts.step2_run_import import check_required_quickbi_files, confirmed_zero_quickbi_sources
+from scripts.step2_run_import import (
+    check_required_quickbi_files,
+    confirmed_zero_quickbi_sources,
+    find_step1_upload_residuals,
+    tm_order_import_complete,
+)
 
 
 class QuickBICompletionGateTests(unittest.TestCase):
+    def test_yesterday_backup_does_not_hide_today_download_residual(self):
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            backup_target = Path(backup_dir) / "dunhill_BI订单源"
+            backup_target.mkdir()
+            (backup_target / "BI_tm_t01_trade_order_line_20260817.xlsx").touch()
+
+            download = Path(download_dir) / "BI_tm_t01_trade_order_line_20260818.xlsx"
+            download.touch()
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual([item["name"] for item in residuals], [download.name])
+
+    def test_exact_backup_file_proves_today_download_was_uploaded(self):
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            filename = "BI_tm_t01_trade_order_line_20260818.xlsx"
+            backup_target = Path(backup_dir) / "dunhill_BI订单源"
+            backup_target.mkdir()
+            (backup_target / filename).touch()
+
+            download = Path(download_dir) / filename
+            download.touch()
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual(residuals, [])
+
+    def test_same_backup_name_with_different_content_does_not_prove_upload(self):
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            filename = "BI_tm_t01_trade_order_line_20260818.xlsx"
+            backup_target = Path(backup_dir) / "dunhill_BI订单源"
+            backup_target.mkdir()
+            (backup_target / filename).write_bytes(b"old")
+
+            download = Path(download_dir) / filename
+            download.write_bytes(b"new")
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual([item["name"] for item in residuals], [filename])
+
+    def test_yesterday_named_quickbi_file_is_not_a_today_source_even_if_touched_today(self):
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            download = Path(download_dir) / "BI_tm_t01_trade_order_line_20260817.xlsx"
+            download.touch()
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual(residuals, [])
+
+    def test_dtc_quickbi_file_is_part_of_upload_residual_gate(self):
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            download = Path(download_dir) / "BI_dtc_t01_trade_order_line_20260818.xlsx"
+            download.touch()
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual([item["name"] for item in residuals], [download.name])
+
+    def test_empty_live_order_is_valid_no_data_without_backup(self):
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
+            day = date(2026, 8, 18)
+            download = Path(download_dir) / "直播间成交订单明细 2026-08-17.xlsx"
+            pd.DataFrame(columns=["订单号"]).to_excel(download, index=False)
+            timestamp = datetime(2026, 8, 18, 9, 20).timestamp()
+            os.utime(download, (timestamp, timestamp))
+
+            residuals = find_step1_upload_residuals(download_dir, day, backup_dir)
+
+        self.assertEqual(residuals, [])
+
     def test_missing_dtc_order_is_reported_even_when_other_sources_exist(self):
         with tempfile.TemporaryDirectory() as download_dir, tempfile.TemporaryDirectory() as backup_dir:
             date_token = "20260625"
@@ -77,6 +172,12 @@ class QuickBICompletionGateTests(unittest.TestCase):
             hints = classify_failure(log_path)
 
         self.assertTrue(any("DTC 订单源未生成当天文件" in hint for hint in hints))
+
+    def test_tm_order_reconciliation_requires_every_source_key_in_database(self):
+        source_keys = {("order-1", "line-1"), ("order-2", "line-2")}
+
+        self.assertFalse(tm_order_import_complete(source_keys, {("order-1", "line-1")}))
+        self.assertTrue(tm_order_import_complete(source_keys, source_keys))
 
 
 if __name__ == "__main__":

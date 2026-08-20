@@ -74,7 +74,8 @@ import yaml
 import time
 import re
 import glob
-from datetime import date, timedelta
+import filecmp
+from datetime import date
 
 
 class TaskTracker:
@@ -250,6 +251,8 @@ STEP1_UPLOAD_PATTERNS = [
     ("TM订单补充", ["BI_tm_t01_trade_order_line*.xlsx"]),
     ("TM退款成功补充", ["BI_tm_trade_refund_info_allsuc_filter*.xlsx"]),
     ("TM待退款补充", ["BI_tm_trade_refund_info_paydate_filter*.xlsx"]),
+    ("DTC订单补充", ["BI_dtc_t01_trade_order_line*.xlsx"]),
+    ("DTC退款补充", ["BI_dtc_t01_trade_refund_info_allsuc_filter*.xlsx"]),
     ("经营参谋店铺源", ["dunhill_shop_d_recent_*.xlsx"]),
     ("经营参谋流量源", ["dunhill_traffic_d_recent_*.xlsx"]),
     ("经营参谋商品源", ["dunhill_product_d_recent_*.xlsx"]),
@@ -262,10 +265,23 @@ STEP1_BACKUP_TARGETS = {
     "TM订单补充": "dunhill_BI订单源",
     "TM退款成功补充": "dunhill_TM退款源_hive",
     "TM待退款补充": "dunhill_TM退款源_hive",
+    "DTC订单补充": "dunhill_DTC订单源_hive",
+    "DTC退款补充": "dunhill_DTC退款源_hive",
     "经营参谋店铺源": "dunhill_tm取数源_backup",
     "经营参谋流量源": "dunhill_tm流量源_new",
     "经营参谋商品源": "dunhill_tm商品源",
     "经营参谋商品流量源": "dunhill_tm商品流量源",
+}
+DATED_STEP1_LABELS = {
+    "TM订单补充",
+    "TM退款成功补充",
+    "TM待退款补充",
+    "DTC订单补充",
+    "DTC退款补充",
+    "经营参谋店铺源",
+    "经营参谋流量源",
+    "经营参谋商品源",
+    "经营参谋商品流量源",
 }
 
 
@@ -310,31 +326,33 @@ def is_empty_live_order_file(path):
         return False
 
 
-def backup_has_uploaded_source(label, patterns, save_path, day):
-    """Check backup for today's uploaded source instead of requiring Downloads cleanup."""
+def backup_has_uploaded_file(label, file_path, save_path):
+    """Return True only when the backup has the same name and contents."""
     target = STEP1_BACKUP_TARGETS.get(label)
-    backup_dir = os.path.join(save_path, target) if target else save_path
-    if not os.path.isdir(backup_dir):
-        return False
+    backup_dir = Path(save_path) / target if target else Path(save_path)
+    filename = os.path.basename(file_path)
+    if target:
+        candidates = [backup_dir / filename]
+    else:
+        candidates = backup_dir.rglob(filename)
+    return any(
+        path.is_file() and filecmp.cmp(file_path, path, shallow=False)
+        for path in candidates
+    )
 
-    tokens = set(date_tokens(day.isoformat()))
-    tokens.update(date_tokens((day - timedelta(days=1)).isoformat()))
-    for pattern in patterns:
-        for file_path in glob.glob(os.path.join(backup_dir, "**", pattern), recursive=True):
-            if not os.path.isfile(file_path):
-                continue
-            name = os.path.basename(file_path)
-            if file_mtime_is_today(file_path, day) or any(token in name for token in tokens):
-                return True
-    return False
+
+def filename_matches_day(path, day):
+    compact, hyphen = date_tokens(day.isoformat())
+    filename = os.path.basename(path)
+    return compact in filename or hyphen in filename
 
 
 def find_step1_upload_residuals(download_path, day=None, save_path=None):
     """
     Return Step 1 sources that still need upload handling.
 
-    Completion is defined by today's source existing in data-import backup. An
-    empty live-order export in Downloads is a valid no-order day and needs no upload.
+    Completion requires the exact current source in data-import backup. An empty
+    live-order export in Downloads is a valid no-order day and needs no upload.
     """
     if day is None:
         day = date.today()
@@ -344,13 +362,15 @@ def find_step1_upload_residuals(download_path, day=None, save_path=None):
     residuals = []
     seen = set()
     for label, patterns in STEP1_UPLOAD_PATTERNS:
-        if backup_has_uploaded_source(label, patterns, save_path, day):
-            continue
         for pattern in patterns:
             for file_path in glob.glob(os.path.join(download_path, pattern)):
                 if not os.path.isfile(file_path):
                     continue
                 if not file_mtime_is_today(file_path, day):
+                    continue
+                if label in DATED_STEP1_LABELS and not filename_matches_day(file_path, day):
+                    continue
+                if backup_has_uploaded_file(label, file_path, save_path):
                     continue
                 key = os.path.abspath(file_path)
                 if key in seen:
@@ -475,6 +495,58 @@ def quickbi_completion_gate(run_succeeded, files_ok, missing_files, confirmed_ze
     """只有子流程成功且当天必需 QuickBI 文件齐全时才允许 Step 2 成功。"""
     unresolved = [source for source in missing_files if source not in confirmed_zero_sources]
     return bool(run_succeeded and (files_ok or not unresolved)), unresolved
+
+
+def tm_order_import_complete(source_keys, database_keys):
+    """Return whether every order line in today's source is present in MySQL."""
+    return bool(source_keys) and source_keys <= database_keys
+
+
+def verify_tm_order_database(data_import_dir, run_day, save_path=None):
+    """Reconcile today's Tmall order source keys against the destination table."""
+    import pandas as pd
+    from sqlalchemy import bindparam, text
+
+    if save_path is None:
+        save_path = get_default_save_path()
+    compact, hyphen = date_tokens(run_day.isoformat())
+    backup_dir = Path(save_path) / STEP1_BACKUP_TARGETS["TM订单补充"]
+    source_files = [
+        path for path in backup_dir.glob("BI_tm_t01_trade_order_line*.xlsx")
+        if compact in path.name or hyphen in path.name
+    ]
+    source_keys = set()
+    for path in source_files:
+        frame = pd.read_excel(path, dtype={"订单号": str, "子订单号": str})
+        frame.columns = [str(column).split("-")[0].strip() for column in frame.columns]
+        if not {"订单号", "子订单号"} <= set(frame.columns):
+            raise ValueError(f"天猫订单源缺少订单号/子订单号列: {path.name}")
+        source_keys.update(
+            (str(order).strip(), str(line).strip())
+            for order, line in frame[["订单号", "子订单号"]].dropna().itertuples(index=False, name=None)
+        )
+    if not source_keys:
+        return False, "当天备份中没有可核验的天猫订单行"
+
+    sys.path.insert(0, data_import_dir)
+    sys.path.insert(0, os.path.join(data_import_dir, "src"))
+    from data_pipeline.core import Engines
+
+    statement = text(
+        "SELECT `订单号`, `子订单号` FROM `dunhill_bi订单源` "
+        "WHERE `订单号` IN :order_ids"
+    ).bindparams(bindparam("order_ids", expanding=True))
+    database_keys = set()
+    order_ids = sorted({order for order, _ in source_keys})
+    with Engines[0].connect() as connection:
+        for start in range(0, len(order_ids), 500):
+            rows = connection.execute(statement, {"order_ids": order_ids[start:start + 500]})
+            database_keys.update((str(order).strip(), str(line).strip()) for order, line in rows)
+
+    missing_count = len(source_keys - database_keys)
+    if not tm_order_import_complete(source_keys, database_keys):
+        return False, f"数据库缺少当天源中的 {missing_count} 个订单行"
+    return True, f"数据库已核验当天源中的 {len(source_keys)} 个订单行"
 
 
 def run_taobao_login_interactive(data_import_dir):
@@ -1480,8 +1552,20 @@ def run_import_script(
         confirmed_zero_sources = confirmed_zero_quickbi_sources(
             Path(__file__).resolve().parents[1] / "runs" / today_str / "logs"
         )
+        tm_order_ok = True
+        if "BI_tm_t01_trade_order_line" not in confirmed_zero_sources:
+            tm_order_ok, tm_order_detail = verify_tm_order_database(
+                data_import_dir,
+                date.today(),
+            )
+            tracker.update_status(
+                'file_verification',
+                'completed' if tm_order_ok else 'failed',
+                tm_order_detail,
+            )
+            print(f"\n{'[OK]' if tm_order_ok else '[FAIL]'} 天猫订单数据库对账: {tm_order_detail}")
         step_succeeded, missing_quickbi = quickbi_completion_gate(
-            run_succeeded=pipeline_succeeded and alimama_ok,
+            run_succeeded=pipeline_succeeded and alimama_ok and tm_order_ok,
             files_ok=quickbi_files_ok,
             missing_files=missing_quickbi,
             confirmed_zero_sources=confirmed_zero_sources,

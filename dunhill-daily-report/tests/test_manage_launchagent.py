@@ -35,8 +35,8 @@ class LaunchAgentTests(unittest.TestCase):
         runner = (root / "scripts" / "launchagent_runner.sh").read_text(encoding="utf-8")
 
         self.assertIn('cd "$ROOT_DIR"', runner)
-        self.assertIn('mkdir "$LOCK_DIR"', runner)
-        self.assertIn("trap cleanup EXIT INT TERM", runner)
+        self.assertIn('/usr/bin/lockf -t 0 "$LOCK_FILE" "$0"', runner)
+        self.assertIn("lock_exit -eq 75", runner)
         self.assertIn('PYTHON_BIN="/Users/novel/Projects/data-import/.venv/bin/python"', runner)
         self.assertIn('"$PYTHON_BIN" -u scripts/daily_orchestrator.py', runner)
         self.assertNotIn("step3", runner.lower())

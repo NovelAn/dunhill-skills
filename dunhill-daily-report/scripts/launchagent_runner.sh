@@ -4,22 +4,22 @@ set -u
 
 ROOT_DIR="${0:A:h:h}"
 RUNS_DIR="$ROOT_DIR/runs"
-LOCK_DIR="$RUNS_DIR/.launchagent.lock"
+LOCK_FILE="$RUNS_DIR/.launchagent.lock"
 RUNNER_LOG="$RUNS_DIR/launchagent.runner.log"
 PYTHON_BIN="/Users/novel/Projects/data-import/.venv/bin/python"
 LARK_CLI_BIN="/Users/novel/.nvm/versions/node/v20.19.6/bin/lark-cli"
 
 mkdir -p "$RUNS_DIR"
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "Run already active; skipping duplicate trigger." >> "$RUNNER_LOG"
-  exit 0
+if [[ "${DUNHILL_LAUNCHAGENT_LOCKED:-0}" != "1" ]]; then
+  DUNHILL_LAUNCHAGENT_LOCKED=1 /usr/bin/lockf -t 0 "$LOCK_FILE" "$0"
+  lock_exit=$?
+  if [[ $lock_exit -eq 75 ]]; then
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "Run already active; skipping duplicate trigger." >> "$RUNNER_LOG"
+    exit 0
+  fi
+  exit "$lock_exit"
 fi
-
-cleanup() {
-  rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
 
 export LARK_CLI_BIN
 export PATH="${LARK_CLI_BIN:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
