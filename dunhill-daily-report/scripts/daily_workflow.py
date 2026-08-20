@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from scripts.workflow_dag import DagRunner, TaskResult, TaskSpec, atomic_write_json
-from scripts.workflow_tasks import run_step1_task
+from scripts.workflow_tasks import run_step1_task, run_step2_task
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -28,13 +28,6 @@ def _test_runner(task_id: str) -> Callable:
     return run
 
 
-def _blocked_runner(task_id: str) -> Callable:
-    def run(_context):
-        return TaskResult(task_id, "blocked", error_type="migration_pending")
-
-    return run
-
-
 def _step1_runner(task_id: str) -> Callable:
     def run(_context):
         download_dir = Path(os.environ.get("DOWNLOAD_DIR", str(Path.home() / "Downloads")))
@@ -43,8 +36,22 @@ def _step1_runner(task_id: str) -> Callable:
     return run
 
 
+def _real_runner(task_id: str) -> Callable:
+    if task_id in (
+        "refund_export",
+        "live_export",
+        *(f"quickbi_browser.{source}" for source in QUICKBI_SOURCES),
+    ):
+        return _step1_runner(task_id)
+
+    def run(_context):
+        return run_step2_task(task_id, ROOT_DIR)
+
+    return run
+
+
 def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
-    runner = _test_runner if test_mode else _blocked_runner
+    runner = _test_runner if test_mode else _real_runner
     specs: dict[str, TaskSpec] = {}
 
     for task_id in (
