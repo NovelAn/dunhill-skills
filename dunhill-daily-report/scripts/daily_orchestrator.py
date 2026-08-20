@@ -464,7 +464,8 @@ def build_lark_post_content(config: dict, state: dict, run_dir: Path) -> str:
 
     if not first_line:
         first_line.append({"tag": "text", "text": "各位 "})
-    first_line.append({"tag": "text", "text": "dunhill的日报和订单相关数据已经更新。"})
+    message_text = lark_config.get("message_text", "dunhill的日报和订单相关数据已经更新。")
+    first_line.append({"tag": "text", "text": message_text})
 
     second_line = [{"tag": "text", "text": f"运行日期: {run_date}"}]
 

@@ -104,6 +104,7 @@ notifications:
     send_identity: "bot"
     chat_name: "数据更新提醒"
     chat_id: "oc_2713a524be31fe0092cbfe94533407ac"
+    message_text: "dunhill的日报和订单相关数据已经更新。"
     mention_members:
       - name: "徐加琪"
         open_id: "ou_93e3e19a20ea365d45100d3cf12ddfa7"
