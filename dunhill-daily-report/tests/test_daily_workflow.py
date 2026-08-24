@@ -44,6 +44,39 @@ class DailyWorkflowTests(unittest.TestCase):
         self.assertEqual(specs["dtc_buyer_type"].deps, ("database_reconcile",))
         self.assertNotIn("pfs_buyer_type", specs["dtc_buyer_type"].deps)
 
+    def test_every_step1_download_source_has_upload_chain(self):
+        # 一致性锚点：每个 step1 下载源（quickbi_browser.* 是 quickbi_api 的兜底除外）
+        # 必须出现在 source_tasks 并拥有 verify→upload→reconcile 链，
+        # 否则下载的文件会躺在 Downloads 里永远不入库（2026-08-21 千牛退款源事故）
+        specs = build_task_specs(test_mode=True)
+        download_sources = [
+            task_id
+            for task_id in specs
+            if task_id in ("refund_export", "live_export", "sycm_download")
+            or task_id.startswith(("jycm_download.", "quickbi_api."))
+        ]
+        self.assertTrue(download_sources)
+        for source in download_sources:
+            self.assertIn(f"targeted_upload.{source}", specs, f"{source} 缺少上传任务")
+            self.assertIn(f"source_verify.{source}", specs, f"{source} 缺少验证任务")
+            self.assertIn(f"database_reconcile.{source}", specs, f"{source} 缺少对账任务")
+            self.assertEqual(
+                specs[f"targeted_upload.{source}"].deps,
+                (f"source_verify.{source}",),
+            )
+            self.assertEqual(
+                specs[f"database_reconcile.{source}"].deps,
+                (f"targeted_upload.{source}",),
+            )
+            if source.startswith("quickbi_api."):
+                name = source.split(".", 1)[1]
+                # browser 兜底必须挂在 API 之后，且 verify 同时依赖两者（任一通道产出即可上传）
+                self.assertEqual(
+                    specs[f"quickbi_browser.{name}"].deps,
+                    (source,),
+                )
+                self.assertIn(f"quickbi_browser.{name}", specs[f"source_verify.{source}"].deps)
+
     def test_nickname_crawlers_require_auth_and_unmask(self):
         specs = build_task_specs(test_mode=True)
         self.assertEqual(

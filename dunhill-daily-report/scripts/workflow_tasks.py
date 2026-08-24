@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import sys
@@ -37,7 +38,7 @@ QUICKBI_UPLOAD_TARGETS = {
     "tm_refund_success": "dunhill_TM退款源_hive",
     "tm_refund_pending": "dunhill_TM退款源_hive",
     "dtc_order": "dunhill_DTC订单源_hive",
-    "dtc_refund": "dunhill_DTC退款源",
+    "dtc_refund": "dunhill_DTC退款源_hive",
 }
 
 # ponytail: reconcile v1 uses backup-file evidence except tm_order (real DB keys);
@@ -45,13 +46,14 @@ QUICKBI_UPLOAD_TARGETS = {
 BACKUP_TARGETS = {
     "445603": "dunhill_tm取数源_backup",
     "225266": "dunhill_tm流量源_new",
+    "446524": "dunhill_tm客户源",
     "445350": "dunhill_tm商品源",
     "458866": "dunhill_tm商品流量源",
     "tm_order": "dunhill_BI订单源",
     "tm_refund_success": "dunhill_TM退款源_hive",
     "tm_refund_pending": "dunhill_TM退款源_hive",
     "dtc_order": "dunhill_DTC订单源_hive",
-    "dtc_refund": "dunhill_DTC退款源",
+    "dtc_refund": "dunhill_DTC退款源_hive",
 }
 
 STEP2_TIMEOUTS = {
@@ -130,7 +132,55 @@ def _error_type(output: str) -> str:
     return "file_error"
 
 
+def _row_count(path: Path) -> int | None:
+    """读 Excel 数据行数；打不开返回 None（视为未知，不拦下载）。"""
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(path, read_only=True)
+        ws = wb.active
+        rows = sum(1 for _ in ws.iter_rows(min_row=2, values_only=True) if any(cell is not None for cell in _))
+        wb.close()
+        return rows
+    except Exception:
+        return None
+
+
+QUICKBI_PREVIEW_LIMIT = 50
+
+
+def _quarantine_truncated(path: Path) -> Path:
+    """把 API 预览截断文件移到隔离目录：既躲开上传模板匹配，又作为"已判截断"的标记。"""
+    quarantine_dir = path.parent / "truncated_previews"
+    quarantine_dir.mkdir(exist_ok=True)
+    target = quarantine_dir / path.name
+    path.rename(target)
+    logging.info(f"{path.name} 达到 {QUICKBI_PREVIEW_LIMIT} 行预览上限，移入 {quarantine_dir.name}/，转浏览器全量导出")
+    return target
+
+
+def _is_truncated_marker(download_dir: Path, filename: str) -> bool:
+    return (download_dir / "truncated_previews" / filename).exists()
+
+
 def run_step1_task(task_id: str, root_dir: Path, download_dir: Path, timeout: int = 420) -> TaskResult:
+    # quickbi_browser.* 是 quickbi_api.* 的导出兜底；API 预览最多 50 行，达到上限说明被截断
+    if task_id.startswith("quickbi_browser."):
+        source = task_id.split(".", 1)[1]
+        pattern = _daily_glob(QUICKBI_PREFIXES[source], date.today())
+        backup_dir = _default_save_path() / BACKUP_TARGETS.get(source, "")
+        existing = list(download_dir.glob(pattern))
+        if not existing:
+            existing = list(backup_dir.glob(pattern))
+        if existing:
+            rows = _row_count(existing[0])
+            marker = _is_truncated_marker(download_dir, existing[0].name)
+            if rows is None or rows < QUICKBI_PREVIEW_LIMIT or marker:
+                # rows<50：API 数据完整；marker 存在：此文件已是浏览器全量导出（resume 场景）
+                return TaskResult(task_id, "skipped", evidence={"skipped_by": f"quickbi_api.{source}", "found": existing[0].name, "rows": rows, "full_export": marker})
+            # ≥50 行且无标记：API 截断文件，隔离后走浏览器全量导出
+            _quarantine_truncated(existing[0])
+
     before = {path for path in download_dir.glob("*.xlsx") if path.is_file()}
     started = time.time()
     try:
@@ -140,10 +190,16 @@ def run_step1_task(task_id: str, root_dir: Path, download_dir: Path, timeout: in
 
     output = f"{result.stdout}\n{result.stderr}"
     outputs = _files_matching(download_dir, task_id, before)
+    if task_id == "live_export" and not outputs and result.returncode == 0:
+        # export_live 当日已有所需文件时会跳过下载直接成功（DAG 重试场景），此时没有"新增"文件
+        outputs = _files_matching(download_dir, task_id, set())
     if result.returncode != 0:
         return TaskResult.failed(task_id, _error_type(output), retryable=_error_type(output) == "transient_network", evidence={"exit_code": result.returncode, "log_tail": output[-1000:]})
     if outputs:
         return TaskResult.success(task_id, outputs=[str(path) for path in outputs], evidence={"new_files": len(outputs), "duration_seconds": round(time.time() - started, 2)})
+    if task_id.startswith("quickbi_browser."):
+        # 脚本正常退出但没有新文件 = 页面查询为空（如 dtc_refund 近期无退款），正常业务结果
+        return TaskResult.no_data(task_id, evidence={"rows": 0, "confirmed_by": "browser_export"})
     if re.search(r'"rows"\s*:\s*0|rows\s*[:=]\s*0|无数据|no data', output, re.IGNORECASE):
         return TaskResult.no_data(task_id, evidence={"rows": 0, "confirmed_by": "export_log"})
     return TaskResult.failed(task_id, "file_error", evidence={"message": "command succeeded but produced no new source file"})
@@ -164,11 +220,18 @@ def step2_command(task_id: str, run_day: date) -> tuple[list[str], int] | None:
         return _manage("quickbi"), STEP2_TIMEOUTS["quickbi"]
     if task_id.startswith("targeted_upload."):
         source_task = task_id.split(".", 1)[1]
+        if source_task == "refund_export":
+            # 千牛后台退款导出 → 主退款源（mission 在 modules.dunhill.ali.order）
+            return _uploader("--target", "dunhill_TM退款源"), STEP2_TIMEOUTS["upload"]
+        if source_task == "live_export":
+            # 直播三件套：大盘/场次/订单明细（mission 在 modules.dunhill.ali.livestream）
+            return _manage("upload", "-m", "modules.dunhill.ali.livestream"), STEP2_TIMEOUTS["upload"]
         if source_task.startswith("jycm_download."):
             template = JYCM_SAVE_NAMES[source_task.split(".", 1)[1]]
             return _uploader("--template", template), STEP2_TIMEOUTS["upload"]
         if source_task == "sycm_download":
-            return _manage("upload", "-m", "modules.dunhill.ali.sycm"), STEP2_TIMEOUTS["upload"]
+            # sycm_download 实际产出的是 dunhill_*_d_recent_* 文件，属 jycm 模块的任务
+            return _manage("upload", "-m", "modules.dunhill.ali.jycm"), STEP2_TIMEOUTS["upload"]
         source = source_task.split(".", 1)[1]
         return _uploader("--target", QUICKBI_UPLOAD_TARGETS[source]), STEP2_TIMEOUTS["upload"]
     if task_id == "unmask_buyer_nicknames":
@@ -188,26 +251,37 @@ def step2_command(task_id: str, run_day: date) -> tuple[list[str], int] | None:
     return None
 
 
+def _daily_glob(prefix: str, run_day: date) -> str:
+    """当日源文件名统一为 `{prefix}_{YYYYMMDD}*.xlsx`（crawler/下载均带下划线；JYCM_SAVE_NAMES 前缀本身以 _ 结尾）。"""
+    return f"{prefix.rstrip('_')}_{run_day.strftime('%Y%m%d')}*.xlsx"
+
+
 def _source_file_token(source_task: str, run_day: date) -> tuple[str, str] | None:
-    """Return (glob prefix, backup target) for verify/reconcile tasks."""
-    today = run_day.strftime("%Y%m%d")
+    """Return (glob pattern, backup target) for verify/reconcile tasks."""
+    if source_task == "refund_export":
+        # 千牛后台退款导出：文件名纯数字时间戳，无法从文件名判断日期——用" Downloads 中存在未消费文件"判定
+        files = [p for p in _download_dir().glob("*.xlsx") if re.match(r"^\d+_\d+_\d+\.xlsx$", p.name)]
+        return (next((p.name for p in files), ""), "dunhill_TM退款源") if files else (f"__none_{run_day}", "dunhill_TM退款源")
+    if source_task == "live_export":
+        return "直播间*.xlsx", "dunhill_直播取数源"
     if source_task.startswith("jycm_download."):
         report_id = source_task.split(".", 1)[1]
         save_name = JYCM_SAVE_NAMES.get(report_id)
         if not save_name:
             return None
-        return save_name + today + "*.xlsx", BACKUP_TARGETS.get(report_id, "")
+        return _daily_glob(save_name, run_day), BACKUP_TARGETS.get(report_id, "")
     if source_task == "sycm_download":
-        return "dunhill_*d_*" + today + "*.xlsx", "dunhill_tm取数源_backup"
+        return _daily_glob("dunhill_*d_*", run_day), "dunhill_tm取数源_backup"
     if source_task.startswith("quickbi_api."):
         source = source_task.split(".", 1)[1]
         prefix = QUICKBI_PREFIXES[source]
-        return prefix + "*.xlsx", BACKUP_TARGETS[source]
+        return _daily_glob(prefix, run_day), BACKUP_TARGETS[source]
     return None
 
 
 def _download_dir() -> Path:
-    return Path(__import__("os").environ.get("DOWNLOAD_DIR", str(Path.home() / "Downloads")))
+    # .env 注入的值可能是未展开的 ~/Downloads（相对路径，glob 永远为空），必须 expanduser
+    return Path(__import__("os").environ.get("DOWNLOAD_DIR", str(Path.home() / "Downloads"))).expanduser()
 
 
 def _default_save_path() -> Path:
@@ -220,7 +294,23 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
     run_day = date.today()
     started = time.time()
 
-    if task_id in ("taobao_auth_check", "alimama_auth_check", "database_reconcile"):
+    if task_id == "taobao_auth_check":
+        # 真实检测千牛 cookies：调用 data-import 项目的 check_taobao_cookie_health
+        check = [str(DATA_IMPORT_PYTHON), "-c",
+                 "import sys; sys.path.insert(0, 'src'); "
+                 "from data_pipeline.crawler.base import check_taobao_cookie_health; "
+                 "sys.exit(0 if check_taobao_cookie_health() else 1)"]
+        try:
+            result = subprocess.run(check, cwd=str(DATA_IMPORT_DIR), capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as error:
+            return TaskResult.failed(task_id, "transient_network", retryable=True, evidence={"message": str(error)})
+        if result.returncode != 0:
+            return TaskResult.failed(task_id, "auth_required", retryable=True,
+                                     evidence={"message": "千牛 cookies 已过期，请运行 scripts/login/taobao_login.py",
+                                               "log_tail": (result.stdout + result.stderr)[-500:]})
+        return TaskResult.success(task_id, evidence={"gate": "check_taobao_cookie_health"})
+
+    if task_id in ("alimama_auth_check", "database_reconcile"):
         # Gates enforced through dependent command exit codes / dependency status.
         return TaskResult.success(task_id, evidence={"gate": "delegated"})
 
@@ -229,11 +319,24 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
         token = _source_file_token(source_task, run_day)
         if not token:
             return TaskResult.failed(task_id, "migration_pending", evidence={"message": f"no source mapping for {source_task}"})
-        pattern, _ = token
-        files = sorted(_download_dir().glob(pattern))
-        if files:
-            return TaskResult.success(task_id, outputs=[str(path) for path in files], evidence={"files": [path.name for path in files]})
-        return TaskResult.failed(task_id, "file_error", evidence={"message": f"no download matching {pattern}"})
+        pattern, backup_target = token
+        files: list = []
+        # 短重试：并发写/同步盘抖动会让 glob 瞬时落空（2026-08-22 事故），不该一次落空就拖死上传链
+        for attempt in range(3):
+            files = sorted(_download_dir().glob(pattern))
+            if not files and backup_target:
+                # 上传后文件被 move 到 backup；重试/续跑场景下 backup 里有当日产物同样算验证通过
+                files = sorted((_default_save_path() / backup_target).glob(pattern if pattern != f"__none_{run_day}" else "*"))
+            if files:
+                return TaskResult.success(task_id, outputs=[str(path) for path in files], evidence={"files": [path.name for path in files]})
+            time.sleep(1)
+        return TaskResult.failed(task_id, "file_error", evidence={"message": f"no download matching {pattern}", "diagnostics": {
+            "download_dir": str(_download_dir()),
+            "download_dir_env": __import__("os").environ.get("DOWNLOAD_DIR"),
+            "cwd": __import__("os").getcwd(),
+            "dir_entries": len(list(_download_dir().iterdir())),
+            "sample": sorted(p.name for p in _download_dir().iterdir())[:8],
+        }})
 
     if task_id.startswith("database_reconcile."):
         source_task = task_id.split(".", 1)[1]
@@ -241,6 +344,14 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
         if not token:
             return TaskResult.failed(task_id, "migration_pending", evidence={"message": f"no source mapping for {source_task}"})
         pattern, backup_target = token
+        if source_task == "refund_export":
+            # 千牛退款源 verify 通过 = 当日文件已上传（verify 已兜底查过 backup）；
+            # Downloads 无文件且 backup 无当日新增 = 当天没有退款导出任务，no_data 而非 failed
+            backup_dir = _default_save_path() / backup_target
+            fresh = [p.name for p in backup_dir.glob("*.xlsx") if p.stat().st_mtime >= time.mktime(run_day.timetuple())]
+            if fresh:
+                return TaskResult.success(task_id, evidence={"backup": fresh})
+            return TaskResult.no_data(task_id, evidence={"message": "当日无千牛退款导出（Downloads 与 backup 均无新文件）"})
         if source_task == "quickbi_api.tm_order":
             from scripts.step2_run_import import verify_tm_order_database
 
@@ -248,20 +359,59 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
             if not ok:
                 return TaskResult.failed(task_id, "database_error", retryable=True, evidence={"message": detail})
             return TaskResult.success(task_id, evidence={"reconciled": detail})
+        if source_task == "live_export":
+            # 大盘+订单明细必须入库；场次实时源可选（可能当天无场次数据），缺失只记录不判失败
+            required = ("dunhill_直播取数源", "dunhill_直播订单源")
+            optional = "dunhill_直播场次实时源"
+            today_ts = time.mktime(run_day.timetuple())
+            found = {d: [p.name for p in (_default_save_path() / d).glob("*.xlsx") if p.stat().st_mtime >= today_ts] for d in (*required, optional)}
+            if not found["dunhill_直播订单源"]:
+                # 空表日：订单明细 0 数据行，upload 正常跳过、文件留在 Downloads——确认后等同已入库
+                empty_orders = [p.name for p in _download_dir().glob("直播间成交订单明细*.xlsx") if (_row_count(p) or 0) == 0 and p.stat().st_mtime >= today_ts]
+                if empty_orders:
+                    found["dunhill_直播订单源"] = [f"{name}（空表，无直播成交）" for name in empty_orders]
+            if all(found[d] for d in required):
+                return TaskResult.success(task_id, evidence={"backup": found, "场次实时源缺失": not found[optional] or None})
+            missing = [d for d in required if not found[d]]
+            detail = f"backup missing for {missing}: 当日直播文件未入库（订单明细空表属正常，由 export_live 直接判 success）"
+            return TaskResult.failed(task_id, "file_error", retryable=True, evidence={"message": detail, "found": found})
         if backup_target and list((_default_save_path() / backup_target).glob(pattern)):
             return TaskResult.success(task_id, evidence={"backup": backup_target, "pattern": pattern})
         return TaskResult.failed(task_id, "file_error", retryable=True, evidence={"message": f"backup missing: {backup_target or '?'}/{pattern}"})
 
     if task_id.startswith("quickbi_api."):
         source = task_id.split(".", 1)[1]
-        pattern = QUICKBI_PREFIXES[source] + run_day.strftime("%Y%m%d") + "*.xlsx"
-        if list(_download_dir().glob(pattern)):
-            # The crawler downloads all five sources at once; reuse them per source.
-            return TaskResult.success(task_id, outputs=[str(path) for path in _download_dir().glob(pattern)], evidence={"already_downloaded": pattern})
+        pattern = _daily_glob(QUICKBI_PREFIXES[source], run_day)
+        found = list(_download_dir().glob(pattern))
+        if not found:
+            found = list((_default_save_path() / BACKUP_TARGETS.get(source, "")).glob(pattern))
+        if found and not _is_truncated_marker(_download_dir(), found[0].name):
+            # 已有当日文件（爬虫一次抓 5 个源，其余任务复用）；backup 命中 = 已上传
+            return TaskResult.success(task_id, outputs=[str(path) for path in found], evidence={"already_downloaded": pattern})
+        mapping = _manage("quickbi"), STEP2_TIMEOUTS["quickbi"]
+        result = _run_subprocess(task_id, mapping)
+        if result is not None and result.status == "failed":
+            return result
+        found = list(_download_dir().glob(pattern))
+        if not found:
+            # 查询为空（如 dtc_refund 近期无退款）或 API 无产出：正常业务场景，让位 browser 兜底判定，
+            # 不能 failed——failed 会把 verify/upload/reconcile 整条链 blocked
+            return TaskResult.no_data(task_id, evidence={"reason": "api 未产出当日文件，转 browser 兜底", "pattern": pattern})
+        rows = _row_count(found[0])
+        if rows is not None and rows >= QUICKBI_PREVIEW_LIMIT:
+            # 预览截断：隔离截断文件，no_data 让 quickbi_browser 走浏览器全量导出
+            _quarantine_truncated(found[0])
+            return TaskResult.no_data(task_id, evidence={"reason": f"达 {QUICKBI_PREVIEW_LIMIT} 行预览上限，转 browser 全量导出", "rows": rows})
+        return TaskResult.success(task_id, outputs=[str(path) for path in found], evidence={"pattern": pattern, "rows": rows})
 
     mapping = step2_command(task_id, run_day)
     if mapping is None:
         return TaskResult.failed(task_id, "migration_pending", evidence={"message": "no adapter yet"})
+    return _run_subprocess(task_id, mapping)
+
+
+def _run_subprocess(task_id: str, mapping: tuple[list[str], int]) -> TaskResult:
+    started = time.time()
     command, timeout = mapping
     env = {**__import__("os").environ, "PYTHONPATH": str(DATA_IMPORT_DIR / "src")}
     try:

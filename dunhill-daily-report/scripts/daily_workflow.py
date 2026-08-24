@@ -59,26 +59,36 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
     runner = _test_runner if test_mode else _real_runner
     specs: dict[str, TaskSpec] = {}
 
-    for task_id in (
-        "refund_export",
-        "live_export",
-        *(f"quickbi_browser.{source}" for source in QUICKBI_SOURCES),
-    ):
+    specs["taobao_auth_check"] = TaskSpec("taobao_auth_check", resources=("chrome_mcp",), runner=runner("taobao_auth_check"))
+
+    # Step1 源先行（千牛退款 + 直播），Step2 下载源等它们完成后再跑
+    step1_sources: tuple[str, ...] = ("refund_export", "live_export")
+    for task_id in step1_sources:
         task_runner = runner(task_id) if test_mode else _step1_runner(task_id)
         specs[task_id] = TaskSpec(task_id, resources=("chrome_mcp", "browser_downloads"), runner=task_runner)
 
-    specs["taobao_auth_check"] = TaskSpec("taobao_auth_check", resources=("chrome_mcp",), runner=runner("taobao_auth_check"))
     for report_id in JYCM_REPORTS:
         task_id = f"jycm_download.{report_id}"
-        specs[task_id] = TaskSpec(task_id, resources=("browser_downloads",), runner=runner(task_id))
+        specs[task_id] = TaskSpec(task_id, deps=step1_sources, resources=("browser_downloads",), runner=runner(task_id))
     specs["sycm_download"] = TaskSpec(
-        "sycm_download", deps=("taobao_auth_check",), resources=("chrome_mcp",), runner=runner("sycm_download")
+        "sycm_download", deps=("taobao_auth_check", *step1_sources), resources=("chrome_mcp",), runner=runner("sycm_download")
     )
     for source in QUICKBI_SOURCES:
-        task_id = f"quickbi_api.{source}"
-        specs[task_id] = TaskSpec(task_id, runner=runner(task_id))
+        # quickbi_crawler 锁：manage.py quickbi 一次抓全部 5 个源，并行跑会并发写同一批文件
+        # （2026-08-22 verify glob 落空的根源）。串行后第一个跑完整爬虫，其余看到文件即秒回。
+        specs[f"quickbi_api.{source}"] = TaskSpec(
+            f"quickbi_api.{source}", deps=step1_sources, resources=("quickbi_crawler",), runner=runner(f"quickbi_api.{source}")
+        )
+    for source in QUICKBI_SOURCES:
+        # quickbi_browser 是 quickbi_api 的兜底（预览 50 行上限，超过则浏览器导出全量）；
+        # 挂在 API 之后，且上传链同时依赖两者——否则浏览器下载的文件没人消费
+        task_id = f"quickbi_browser.{source}"
+        task_runner = runner(task_id) if test_mode else _step1_runner(task_id)
+        specs[task_id] = TaskSpec(task_id, deps=(f"quickbi_api.{source}",), resources=("chrome_mcp", "browser_downloads"), runner=task_runner)
 
     source_tasks = [
+        "refund_export",  # 千牛后台退款导出（主退款源，必须每天入库）
+        "live_export",  # 直播大盘/场次/订单明细
         *(f"jycm_download.{report_id}" for report_id in JYCM_REPORTS),
         "sycm_download",
         *(f"quickbi_api.{source}" for source in QUICKBI_SOURCES),
@@ -88,7 +98,13 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         verify = f"source_verify.{source_task}"
         upload = f"targeted_upload.{source_task}"
         reconcile = f"database_reconcile.{source_task}"
-        specs[verify] = TaskSpec(verify, deps=(source_task,), runner=runner(verify))
+        # quickbi 源的 verify 额外依赖 browser 兜底：两条通道任一产出文件即可上传
+        verify_deps = (
+            (source_task, f"quickbi_browser.{source_task.split('.', 1)[1]}")
+            if source_task.startswith("quickbi_api.")
+            else (source_task,)
+        )
+        specs[verify] = TaskSpec(verify, deps=verify_deps, runner=runner(verify))
         specs[upload] = TaskSpec(upload, deps=(verify,), resources=("mysql_upload",), runner=runner(upload))
         specs[reconcile] = TaskSpec(reconcile, deps=(upload,), resources=("mysql_upload",), runner=runner(reconcile))
         reconciliation_tasks.append(reconcile)
@@ -126,7 +142,8 @@ def current_run_dir() -> Path:
 
 
 def _task_step(task_id: str) -> str:
-    if task_id in {"refund_export", "live_export"} or task_id.startswith("quickbi_browser."):
+    # Step1 = 千牛退款 + 直播浏览器导出；quickbi_browser 是 Step2 QuickBI ≥50 行时的兜底，归 Step2
+    if task_id in {"refund_export", "live_export"}:
         return "step1"
     return "step2"
 

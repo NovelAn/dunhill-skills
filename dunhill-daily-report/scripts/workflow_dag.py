@@ -213,7 +213,11 @@ class DagRunner:
                             state["tasks"][task_id] = asdict(TaskResult(task_id, "blocked", error_type="dependency_failed"))
                             pending.remove(task_id)
                     if pending:
-                        raise RuntimeError(f"DAG cannot make progress: {sorted(pending)}")
+                        # 无法调度（如依赖未就绪且不会就绪）：标记 blocked 落盘而非抛异常崩溃，
+                        # 否则 state 卡在 running、watch 永远停在同一帧
+                        for task_id in list(pending):
+                            state["tasks"][task_id] = asdict(TaskResult(task_id, "blocked", error_type="not_schedulable"))
+                        pending.clear()
                     break
 
                 for future in as_completed(list(futures)):

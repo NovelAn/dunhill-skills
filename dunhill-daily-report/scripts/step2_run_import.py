@@ -27,7 +27,10 @@ if _env_file:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
                 _k, _, _v = _line.partition("=")
-                _k, _v = _k.strip(), _v.strip()
+                _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+                # 路径类配置展开 ~ ：不展开的话 Path("~/Downloads") 是相对路径，glob 永远为空
+                if _v.startswith("~") and (_k.endswith("_DIR") or _k.endswith("_PATH")):
+                    _v = os.path.expanduser(_v)
                 if _k and _k not in os.environ:
                     os.environ[_k] = _v
 

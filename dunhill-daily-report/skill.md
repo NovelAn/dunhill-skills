@@ -7,12 +7,45 @@ description: "Automated Dunhill daily report workflow for e-commerce operations.
 
 Automated workflow for generating Dunhill daily reports from Taobao e-commerce data.
 
+## ⚠️ 首选入口：DAG 工作流（daily_workflow.py）
+
+macOS 上的 Step 1-2 **统一由 DAG 工作流驱动**（LaunchAgent 每天 09:10 自动跑，也可手动执行）：
+
+```bash
+# 状态 / 监控 / 手动执行 / 断点续跑 / 重试失败任务
+python -u scripts/daily_workflow.py status
+python -u scripts/daily_workflow.py watch
+python -u scripts/daily_workflow.py run
+python -u scripts/daily_workflow.py resume
+python -u scripts/daily_workflow.py retry-failed
+```
+
+**DAG 执行顺序（2026-08-22 重排后）**：
+
+```
+Step 1  refund_export（千牛退款主源）+ live_export（直播三件套）
+          ↓
+Step 2  jycm_download ×5 / sycm_download / quickbi_api ×5（manage.py quickbi，串行）
+          ↓        ↘ （某 QuickBI 源 ≥50 行：预览截断）
+          ↓         quickbi_browser.<source>（export_quickbi_chrome.py 浏览器全量导出）
+          ↓
+        source_verify → targeted_upload → database_reconcile（每个下载源一条链）
+          ↓
+        unmask_buyer_nicknames → fq/nickname 爬虫 → pfs/dtc 买家类型更新
+        alimama 认证检查/刷新 → alimama_import
+```
+
+**关键语义**：
+- `manage.py quickbi` 先行判断行数：**<50 行直接采用 API 文件，不碰 Chrome**；≥50 行才触发浏览器全量导出（截断文件自动移入 `~/Downloads/truncated_previews/`）
+- 空结果 = 正常业务结果：dtc_refund 无近期退款、直播订单明细空表、直播场次源缺失 → `no_data`/`skipped`，不判失败
+- 每个下载源必有 verify→upload→reconcile 链（一致性测试锁定）；`tests/` 全绿才能发布
+
 ## ⚠️ CRITICAL EXECUTION REQUIREMENTS
 
 **MUST EXECUTE STEPS SEQUENTIALLY WITH STRICT DEPENDENCY CHECKING:**
 
 1. **Step 2 MUST complete successfully BEFORE Steps 3, 4, or 5**
-   - Step 2 runs `run.py` which downloads all data sources and uploads them to the database
+   - Step 2 完成所有数据源下载与入库（现由 DAG 工作流驱动）
    - You MUST wait for Step 2 to return exit code 0 (success) before proceeding
    - Do NOT start Steps 3 or 4 until Step 2 shows: `[OK] 步骤2执行成功！可以继续执行后续步骤。`
    - Steps 3 and 4 depend on this data being completely loaded into the database
@@ -26,11 +59,11 @@ Automated workflow for generating Dunhill daily reports from Taobao e-commerce d
 
 3. **Execution Order (ENFORCED):**
    ```
-   Step 1 (optional) → Step 2 → Step 3 → Step 4 → Step 5
-                         ↑
-                    MUST WAIT HERE
-                    Until run.py exits
-                    with code 0
+   Step 1（千牛退款+直播） → Step 2（下载+入库+爬虫） → Step 3 → Step 4 → Step 5
+                              ↑
+                         MUST WAIT HERE
+                         Until daily_workflow exits
+                         with code 0
    ```
 
 4. **How to Verify Step 2 Completion:**
@@ -55,13 +88,13 @@ Automated workflow for generating Dunhill daily reports from Taobao e-commerce d
 
 Execute all steps sequentially for complete daily report generation, or run individual steps for testing.
 
-### Step 1: Collect Data from Web Platforms
+### Step 1: Collect Data from Web Platforms（浏览器导出源）
 
-Automates data collection from Taobao platforms:
-- Export refund list as Excel
-- Download live streaming core indicators
-- Download transaction order details (payment & confirmation time)
-- Supplement complete QuickBI TM order/refund files when preview rows exceed 50
+**Step 1 现在只包含两类必须走浏览器导出的数据源**（QuickBI 的浏览器导出已移到 Step 2 作为 ≥50 行时的兜底）：
+- 千牛退款列表导出（`refund_export` → `dunhill_TM退款源`，天猫退款**主数据源**）
+- 直播数据三件套（`live_export`：大盘/分场次/成交订单明细）
+
+在 DAG 中这两个任务先行执行，完成后 Step 2 的下载源才开始跑。
 
 #### Step 1 Routing Rule
 
@@ -176,53 +209,48 @@ python -u scripts/export_live.py
 - 分场次效果: `直播分场次效果-*.xlsx`
 - 订单明细: `直播间成交订单明细-*.xlsx`
 
-#### Step 1c: QuickBI 天猫三源完整文件补充
+**重要 — 订单明细空表是合法结果**: dunhill 不是每天开播。没有直播成交的日子，淘宝直播后台导出的订单明细就是只有表头、0 数据行的空文件，**这不是错误**。`export_live.py` 对 transaction 阶段页面流程失败但订单明细为空表的情况按成功处理；DAG/监控中空订单明细应判定为 `no_data`，不要重试或告警。（novel 2026-08-21 确认，此问题历史上反复被误判为故障）
 
-**Bridge path**:
+#### Step 1c: QuickBI 浏览器兜底导出（已移入 Step 2，≥50 行时自动触发）
+
+**2026-08-22 起 QuickBI 流程改为 API 优先**：`manage.py quickbi`（Step 2）先抓预览数据并检查行数——
+**<50 行直接采用，完全不碰 Chrome**；只有 ≥50 行（预览截断）时，DAG 才自动触发
+`quickbi_browser.<source>` 任务运行 `scripts/export_quickbi_chrome.py` 做浏览器全量导出。
+
+**兜底覆盖的数据源**（5 个 QuickBI 源均可触发）:
+- `BI_tm_t01_trade_order_line`（天猫 t01 订单源）
+- `BI_tm_trade_refund_info_allsuc_filter`（天猫退款成功退款源）
+- `BI_tm_trade_refund_info_paydate_filter`（天猫待退款中退款源）
+- `BI_dtc_t01_trade_order_line`（DTC 订单源）
+- `BI_dtc_t01_trade_refund_info_allsuc_filter`（DTC 退款源）
+
+**运行规则**（DAG 自动执行，无需手动）:
+1. `manage.py quickbi` 抓完检查行数，≥50 行的截断文件被移入 `~/Downloads/truncated_previews/`（既是隔离也是"已判截断"标记）
+2. 浏览器导出脚本打开 QuickBI 页面，创建本轮 `纯数据 Excel` 取数任务并等待完成
+3. 全量文件落到 `~/Downloads` 后走统一的 verify→upload→reconcile 链
+4. resume 场景：文件 ≥50 行但 `truncated_previews/` 有同名标记 = 已是全量导出，跳过重导
+
+**手动调试**（仅需要时）:
 ```bash
 python -u scripts/export_quickbi_chrome.py --sources all
 ```
 
-`scripts/step1_collect_data.py` 默认会在退款和直播下载后运行该补充脚本。仅调试退款/直播时可使用：
-```bash
-python -u scripts/step1_collect_data.py --skip-quickbi
-```
-
-**覆盖的数据源**:
-- `BI_tm_t01_trade_order_line`（天猫 t01 订单源）
-- `BI_tm_trade_refund_info_allsuc_filter`（天猫退款成功退款源）
-- `BI_tm_trade_refund_info_paydate_filter`（天猫待退款中退款源）
-
-**运行规则**:
-1. 打开 QuickBI 页面并读取底部 `查询结果共XX条`。
-2. 如果 `XX <= 50`，跳过；Step 2 的网页爬虫可完整获取。
-3. 如果 `XX > 50`，打开右侧任务列表并创建本轮 `纯数据 Excel` 取数任务。
-4. 记录本轮任务开始时间，等待后台任务完成。
-5. 刷新页面并打开右侧任务列表，只点击 `创建于` 晚于本轮开始时间、且显示绿色成功图标和下载图标的最新任务。
-6. 下载文件落到 `~/Downloads`，文件名形如 `BI_tm_t01_trade_order_line_自助取数_YYYYMMDD_HH_MM_SS.xlsx`。
-
-**与 Step 2 的关系**:
-- Step 2 仍会抓取这三个 QuickBI 源，重复下载没有关系。
-- 数据库导入使用 `INSERT IGNORE`，重复行不会重复插入。
-- Step 1c 的目的只是确保当天 `~/Downloads` 中有完整 QuickBI 文件，避免 Step 2 预览爬虫最多 50 行导致数据不完整。
-
 ### Step 2: Run Data Import Scripts ⚠️ CRITICAL STEP
 
-**PREREQUISITE**: None
+**PREREQUISITE**: Step 1 的 refund_export / live_export 已完成（DAG 依赖保证）
 **CRITICAL**: This step MUST complete successfully before Steps 3, 4, or 5 can execute.
 
-Executes internal data import Python scripts:
-- **Cookie health check**: Pre-checks `.taobao.com` cookies before launching `run.py`. If expired, Step 2 first runs `/Users/novel/projects/data-import/scripts/login/taobao_login_mcp.py` to sync the latest QianNiu/Taobao cookies from normal Chrome through Playwright MCP Extension. This reuses the Chrome login state created by Step 1 and refreshes only the high-frequency Taobao/QianNiu authentication while preserving low-frequency QuickBI/SYCM/JYCM cookies. If MCP cookie sync fails, Step 2 falls back to the legacy interactive login script and auto-selects option `1` (千牛/淘宝).
-- Runs `${ETL_PIPELINES_DIR}/run.py`
-- Downloads all data sources (QuickBI, SYCM, JYCM, etc.)
-- Uploads all data to database
-- Runs the daily Alimama crawler and writes paid media data to the database
+**Step 2 现由 DAG 工作流编排**（`scripts/daily_workflow.py`），顺序为：
+
+- **Cookie health check**: `taobao_auth_check` 任务真实调用 data-import 的 `check_taobao_cookie_health`（向 myseller 发 GET 检查是否 302 到登录页），过期则拦截并提示重新登录
+- JYCM ×5 / SYCM 下载 + QuickBI API 抓取（`manage.py quickbi` 串行，避免并发写文件）
+- **QuickBI ≥50 行预览截断自动转浏览器全量导出**（`quickbi_browser.*` 兜底任务，见 Step 1c）
+- 每个下载源 `source_verify → targeted_upload → database_reconcile` 入库对账
 - Runs stored procedure `UpdateMaskedBuyerNicknames` to auto-decrypt historical buyer nicknames via SQL (reduces crawler request volume and avoids Alibaba anti-bot warnings)
 - Runs order crawlers (nick + fq) for remaining undecrypted orders
 - Runs buyer type updates (PFS + DTC)
-- Monitors output for QuickBI table warnings (>50 rows)
-- Step 1 already performs QuickBI complete-file supplement for the three TM sources; Step 2 may still warn for QuickBI preview tables and can prompt for manual download if other QuickBI files are missing
-- Re-runs upload script if manual downloads occurred
+- Alimama 认证检查/刷新 + 付费数据入库
+- 空查询源（如 dtc_refund 近期无退款）判定 `no_data`，不阻断
 
 **Script**: `scripts/step2_run_import.py`
 
@@ -236,7 +264,7 @@ Executes internal data import Python scripts:
 - Exit code is 0 (success)
 - Success message is displayed
 
-**When QuickBI exceeds 50 rows**: Step 1 should already have downloaded complete files for the three TM QuickBI sources. If Step 2 still reports missing QuickBI files, follow its prompt or rerun `python -u scripts/export_quickbi_chrome.py --sources all`.
+**When QuickBI exceeds 50 rows**: DAG 自动处理——API 抓取后检查行数，≥50 行时截断文件移入 `~/Downloads/truncated_previews/`，随后自动触发 `quickbi_browser.<source>` 浏览器全量导出，拿到全量文件后继续后续任务（解密、买家类型更新等）。无需人工干预；仅兜底任务本身失败时才需要手动跑 `python -u scripts/export_quickbi_chrome.py --sources all` 再 `resume`。
 
 **Alimama auth**: 阿里妈妈 `csrfId`/cookies 通常只有约 1 天有效期。日常执行 Step 2 时推荐使用：
 ```bash
@@ -310,46 +338,42 @@ Creates Outlook email drafts with report attachments:
 
 ### Mac Daily Orchestrator (Step 1-2)
 
-Use the orchestrator for scheduled Mac runs:
+Use the DAG workflow for scheduled Mac runs:
 
 ```bash
-# Actual daily execution in the macOS GUI login session
+# Actual daily execution in the macOS GUI login session（LaunchAgent 09:10 自动触发）
 python -u scripts/manage_launchagent.py install
 
-# Read-only status command for Codex Automation
-python -u scripts/report_daily_status.py
+# 日常操作入口（推荐）
+python -u scripts/daily_workflow.py status     # 查看当日状态
+python -u scripts/daily_workflow.py resume     # 断点续跑/补跑失败任务
+python -u scripts/daily_workflow.py retry-failed
+python -u scripts/report_daily_status.py       # Read-only status command for Codex Automation
 ```
 
 Do not run `daily_orchestrator.py` from a scheduled Codex sandbox. The user
-LaunchAgent owns Step 1-2 execution; Codex Automation only reads and reports the
-result.
+LaunchAgent owns Step 1-2 execution (`daily_workflow.py run`); Codex Automation
+only reads and reports the result. `daily_orchestrator.py` 保留为 legacy 迁移回退
+（`daily_workflow.py legacy`），日常不要直接调用。
 
 Default behavior:
-- Runs Step 1 then Step 2.
+- Runs Step 1（千牛退款+直播）then Step 2（下载+入库+爬虫+买家类型），全部由 DAG 编排、支持断点续跑。
 - Step 2 refreshes Alimama auth first by default.
-- On macOS, the orchestrator wraps itself with `caffeinate -dimsu` so the Mac stays awake while the run is active.
-- Writes state and logs to `runs/YYYY-MM-DD/`.
+- Writes state and logs to `runs/YYYY-MM-DD/state.json`（含每个任务的 receipt/evidence）.
 - After Step 1 and Step 2 both succeed, sends a concise business-facing Feishu/Lark group notification to `数据更新提醒`, mentioning 徐加琪 and 唐玉霞.
 - Stops after Step 2 because Steps 3-5 require Windows Excel Power Query / MySQL refresh support.
-
-Useful options:
-```bash
-python -u scripts/daily_orchestrator.py --from step2
-python -u scripts/daily_orchestrator.py --only step1
-python -u scripts/daily_orchestrator.py --force
-python -u scripts/daily_orchestrator.py --dry-run
-python -u scripts/daily_orchestrator.py --skip-alimama
-python -u scripts/daily_orchestrator.py --no-notify
-python -u scripts/daily_orchestrator.py --notify-dry-run
-```
 
 ### Running Individual Steps
 
 ```bash
-# Step 1: Playwright Chrome Extension + MCP bridge exports
+# Step 1: Playwright Chrome Extension + MCP bridge exports（千牛退款+直播）
 python -u scripts/step1_collect_data.py
 
-# Step 2: Run data import scripts
+# Step 2: DAG 工作流（含下载、50行判断、上传、爬虫、买家类型）
+python -u scripts/daily_workflow.py run
+python -u scripts/daily_workflow.py resume    # 断点续跑
+
+# Step 2 legacy 单脚本入口（迁移回退用，日常不推荐）
 python -u scripts/step2_run_import.py --refresh-alimama-auth-first
 
 # Step 3: Generate PFS report
@@ -442,6 +466,16 @@ This ensures reports are always for the previous complete business day.
 3. **Error handling**: Informative error messages and recovery guidance
 4. **Session persistence**: Login sessions saved for 7-30 days
 
+## Recent Fixes (2026-08-22)
+
+**DAG 工作流重排与根因修复**：
+- 流程重排：千牛退款+直播（Step1）先行 → JYCM/SYCM/QuickBI API 等 Step1 完成后串行下载 → 上传对账 → 解密/爬虫/买家类型
+- QuickBI 改 API 优先：<50 行直接采用；≥50 行自动转浏览器全量导出（截断文件隔离 `~/Downloads/truncated_previews/`）
+- 根因修复 `.env` tilde：`DOWNLOAD_DIR=~/Downloads` 未展开导致 glob 永远为空（"下载了却找不到文件"的闹鬼根源）；`.env` 加载器与 `_download_dir()` 均已 expanduser
+- quickbi 爬虫串行化（`quickbi_crawler` 资源锁），根治 5 个 api 任务并发写同一批文件
+- 空结果语义：dtc_refund 无退款、直播订单空表、场次源缺失 → `no_data`，不阻断下游
+- 每个下载源锁定 verify→upload→reconcile 链（含 quickbi_browser 兜底依赖边），一致性测试防止再次漏配
+
 ## Recent Fixes (2026-01-26)
 
 **PFS Report**:
@@ -470,7 +504,7 @@ This ensures reports are always for the previous complete business day.
 
 **Nick/fq 爬虫大量失败**: 可能是 cookies 过期，也可能是请求量过大触发风控。系统已通过 `UpdateMaskedBuyerNicknames` 存储过程预先解密历史老客昵称以减少爬虫请求量。
 
-**QuickBI exceeds 50 rows**: Step 1 runs `scripts/export_quickbi_chrome.py` to create and download complete QuickBI files for the three TM sources when preview rows exceed 50.
+**QuickBI exceeds 50 rows**: 无需人工干预。DAG 中 `manage.py quickbi` 抓完自动检查行数：<50 行直接采用；≥50 行自动转 `export_quickbi_chrome.py` 浏览器全量导出（截断文件隔离在 `~/Downloads/truncated_previews/`）。手动兜底：`python -u scripts/export_quickbi_chrome.py --sources all`。
 
 **Download button not found**: Script will pause and prompt for manual operation
 

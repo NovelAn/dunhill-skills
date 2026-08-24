@@ -1,6 +1,7 @@
 import unittest
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 from scripts.daily_workflow import _real_runner, build_task_specs
@@ -23,7 +24,10 @@ class Step2CommandMappingTests(unittest.TestCase):
 
     def test_gate_tasks_delegate_without_commands(self):
         self.assertIsNone(step2_command("taobao_auth_check", date(2026, 8, 20)))
-        result = run_step2_task("taobao_auth_check", Path("."))
+        # auth check 是真实子进程调用（连千牛），测试必须 mock，不能依赖当天 cookies 状态
+        with mock.patch("scripts.workflow_tasks.subprocess.run") as run:
+            run.return_value.returncode = 0
+            result = run_step2_task("taobao_auth_check", Path("."))
         self.assertEqual(result.status, "success")
 
 
@@ -38,11 +42,17 @@ class Step2RunnerTests(unittest.TestCase):
         self.assertEqual(result.error_type, "auth_required")
 
     def test_quickbi_api_reuses_existing_download_per_source(self):
-        with mock.patch("scripts.workflow_tasks._download_dir") as download_dir, mock.patch(
-            "scripts.workflow_tasks.subprocess.run"
-        ) as run:
-            download_dir.return_value.glob.return_value = [Path("/tmp/BI_tm_t01_trade_order_line_20260820.xlsx")]
-            result = run_step2_task("quickbi_api.tm_order", Path("."))
+        with TemporaryDirectory() as tmp:
+            fake_downloads = Path(tmp) / "Downloads"
+            fake_downloads.mkdir()
+            stamp = date.today().strftime("%Y%m%d")
+            (fake_downloads / f"BI_tm_t01_trade_order_line_{stamp}.xlsx").write_bytes(b"not-an-excel")
+            with mock.patch(
+                "scripts.workflow_tasks._download_dir", return_value=fake_downloads
+            ), mock.patch(
+                "scripts.workflow_tasks._default_save_path", return_value=Path(tmp) / "backup"
+            ), mock.patch("scripts.workflow_tasks.subprocess.run") as run:
+                result = run_step2_task("quickbi_api.tm_order", Path("."))
         run.assert_not_called()
         self.assertEqual(result.status, "success")
 

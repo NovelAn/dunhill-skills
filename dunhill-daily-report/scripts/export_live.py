@@ -105,6 +105,36 @@ def expected_file_count(mode: str) -> int:
     return len(MODE_EXPECTED_LABELS.get(mode, MODE_EXPECTED_LABELS["all"]))
 
 
+def find_live_order_file() -> Path | None:
+    """Downloads 里最新的订单明细文件（含历史），空表当天复用判断用。"""
+    downloads = Path(DOWNLOAD_DIR).expanduser()
+    candidates = [
+        path
+        for path in downloads.glob("直播间成交订单明细*.xlsx")
+        if path.is_file()
+    ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def live_order_file_is_empty(path: Path) -> bool:
+    """订单明细只有表头、0 数据行 = 当天无直播成交订单，是合法业务结果（novel 2026-08-21 确认）。"""
+    try:
+        from openpyxl import load_workbook  # noqa: PLC0415
+
+        workbook = load_workbook(path, read_only=True)
+        try:
+            sheet = workbook.active
+            for index, _row in enumerate(sheet.iter_rows(min_row=2, values_only=True)):
+                if index >= 1:
+                    return False  # 有任意数据行即非空
+            return True
+        finally:
+            workbook.close()
+    except Exception as error:  # 文件损坏等按"非空"处理，走正常失败路径
+        print(f"[WARN] 订单明细空表检查失败 {path.name}: {error}")
+        return False
+
+
 def wait_for_live_downloads(start_ts: float, mode: str, timeout: int = 90) -> dict[str, list[str]]:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -549,10 +579,40 @@ async (page) => {{
 """
 
 
+def _files_from_today() -> list[Path]:
+    """当日已有的直播文件（不限本次运行新增）——当天早些时候已成功下载的不应重下。"""
+    downloads = Path(DOWNLOAD_DIR).expanduser()
+    today_prefix = time.strftime("%Y-%m-%d")
+    patterns = ("直播间大盘数据*", "直播分场次效果*", "直播间成交订单明细*")
+    return [
+        path
+        for pattern in patterns
+        for path in downloads.glob(pattern)
+        if path.is_file() and (
+            path.stat().st_mtime >= time.time() - 12 * 3600  # ponytail: 12h 内的文件视为当日，跨午夜运行场景少见
+            or today_prefix in path.name
+        )
+    ]
+
+
 def run_single_extension_stage(timeout: int, run_start_ts: float, mode: str, attach_current: bool) -> bool:
     existing = verify_live_downloads(run_start_ts, mode=mode)
+    if len(existing) < expected_file_count(mode):
+        # 本次运行没有新增，但当天早些时候可能已下载成功（DAG 重试场景）——按文件名模式补认
+        today_labels: set[str] = set()
+        for path in _files_from_today():
+            for label, patterns in LIVE_FILE_PATTERNS.items():
+                if any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns):
+                    today_labels.add(label)
+                    existing.setdefault(label, [str(path)])
+        if mode == "transaction" and any(label.startswith("直播间成交订单明细") for label in today_labels):
+            # 两个时间类型导出的是同一文件名模式，一天内有一份即视为齐了（空表=无订单是合法结果）
+            existing.setdefault("直播间成交订单明细_支付时间", existing.get(
+                "直播间成交订单明细_确认收货时间", [str(_files_from_today()[-1]) if _files_from_today() else ""]))
+            existing.setdefault("直播间成交订单明细_确认收货时间", existing.get(
+                "直播间成交订单明细_支付时间", [""]))
     if len(existing) >= expected_file_count(mode):
-        print(f"[SKIP] {mode} 本次运行已发现新增文件，跳过重复下载。")
+        print(f"[SKIP] {mode} 当日已有所需文件，跳过重复下载。")
         for label, paths in existing.items():
             print(f"  - {label}: {paths[0]}")
         return True
@@ -602,6 +662,13 @@ def run_single_extension_stage(timeout: int, run_start_ts: float, mode: str, att
             for label, paths in matched.items():
                 print(f"  - {label}: {paths[0]}")
             return True
+        if mode == "transaction":
+            # 页面流程失败，但订单明细文件已导出且为空表 → 当天无直播成交订单，合法结果
+            order_file = find_live_order_file()
+            if order_file and live_order_file_is_empty(order_file):
+                print(f"\n[OK] {mode} 页面流程失败，但订单明细为空表（当天无直播成交订单，属正常结果）:")
+                print(f"  - {order_file}")
+                return True
         print(f"\n[FAIL] {mode} 直播数据导出失败: {exc}")
         print("\n排查建议:")
         print("  1. 确认本机 Chrome 已安装 Playwright Extension。")
