@@ -290,7 +290,7 @@ def _default_save_path() -> Path:
     return Path(get_default_save_path())
 
 
-def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
+def run_step2_task(task_id: str, root_dir: Path, upstream_state: dict | None = None) -> TaskResult:
     run_day = date.today()
     started = time.time()
 
@@ -330,6 +330,11 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
             if files:
                 return TaskResult.success(task_id, outputs=[str(path) for path in files], evidence={"files": [path.name for path in files]})
             time.sleep(1)
+        # 上游 source 任务本身 no_data（如 dtc_refund 近期无 DTC 退款、浏览器导出空表）
+        # 时，文件不存在是正常结果，verify 同样 no_data，不该拖死上传链
+        upstream = (upstream_state or {}).get("tasks", {}).get(source_task, {})
+        if upstream.get("status") == "no_data":
+            return TaskResult.no_data(task_id, evidence={"message": f"上游 {source_task} 无数据，跳过 {pattern}"})
         return TaskResult.failed(task_id, "file_error", evidence={"message": f"no download matching {pattern}", "diagnostics": {
             "download_dir": str(_download_dir()),
             "download_dir_env": __import__("os").environ.get("DOWNLOAD_DIR"),
@@ -377,6 +382,11 @@ def run_step2_task(task_id: str, root_dir: Path) -> TaskResult:
             return TaskResult.failed(task_id, "file_error", retryable=True, evidence={"message": detail, "found": found})
         if backup_target and list((_default_save_path() / backup_target).glob(pattern)):
             return TaskResult.success(task_id, evidence={"backup": backup_target, "pattern": pattern})
+        # 上游 source 任务 no_data（如 dtc_refund 近期无退款，Downloads/backup 均无产物）
+        # 时，backup 缺失是正常结果，reconcile 同样 no_data
+        upstream = (upstream_state or {}).get("tasks", {}).get(source_task, {})
+        if upstream.get("status") == "no_data":
+            return TaskResult.no_data(task_id, evidence={"message": f"上游 {source_task} 无数据，无需对账 {pattern}"})
         return TaskResult.failed(task_id, "file_error", retryable=True, evidence={"message": f"backup missing: {backup_target or '?'}/{pattern}"})
 
     if task_id.startswith("quickbi_api."):

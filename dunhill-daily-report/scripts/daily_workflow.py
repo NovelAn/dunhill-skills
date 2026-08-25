@@ -49,8 +49,8 @@ def _real_runner(task_id: str) -> Callable:
     ):
         return _step1_runner(task_id)
 
-    def run(_context):
-        return run_step2_task(task_id, ROOT_DIR)
+    def run(context):
+        return run_step2_task(task_id, ROOT_DIR, upstream_state=getattr(context, "state", None))
 
     return run
 
