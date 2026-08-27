@@ -507,11 +507,61 @@ async (page) => {{
     return true;
   }}
 
+  async function fillRangeInput(rangeAttr, text) {{
+    // tbd-picker-range 双输入框：点击 → 全选 → 输入 → Enter 确认
+    const rect = await retryEvaluate(attr => {{
+      const el = document.querySelector(
+        `.tta-order-details input[date-range="${{attr}}"]`
+      ) || document.querySelector(`input[date-range="${{attr}}"]`);
+      if (!el || el.offsetParent === null) return null;
+      const box = el.getBoundingClientRect();
+      return {{ x: box.x, y: box.y, width: box.width, height: box.height }};
+    }}, rangeAttr, `find range input ${{rangeAttr}}`);
+    if (!rect) {{
+      throw new Error(`未找到时间范围输入框 date-range=${{rangeAttr}}`);
+    }}
+    await page.mouse.click(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    await sleep(600);
+    await page.keyboard.press('Control+A');
+    await page.keyboard.type(text, {{ delay: 40 }});
+    await sleep(400);
+    await page.keyboard.press('Enter');
+    await sleep(800);
+  }}
+
+  async function selectTimeRange() {{
+    // 直播后台订单明细的时间范围是 tbd-picker-range 双输入框（无"近7天"快捷项），
+    // 手填：昨天往前 7 天 00:00:00 → 昨天 23:59:59（novel 2026-08-27 确认默认近7天）
+    const pad = n => String(n).padStart(2, '0');
+    const fmtDate = d => `${{d.getFullYear()}}/${{pad(d.getMonth() + 1)}}/${{pad(d.getDate())}}`;
+    const yesterday = new Date(Date.now() - 86400000);
+    const start = new Date(yesterday.getTime() - 6 * 86400000);
+    const startText = `${{fmtDate(start)}} 00:00`;
+    const endText = `${{fmtDate(yesterday)}} 23:59`;
+
+    await fillRangeInput('start', startText);
+    await fillRangeInput('end', endText);
+
+    const values = await retryEvaluate(() => {{
+      const read = attr => {{
+        const el = document.querySelector(`input[date-range="${{attr}}"]`);
+        return el ? el.value : null;
+      }};
+      return {{ start: read('start'), end: read('end') }};
+    }}, undefined, 'verify range values');
+    console.log(`[INFO] 时间范围已填入: ${{values.start}} ~ ${{values.end}}`);
+    if (!values.start?.includes(fmtDate(start)) || !values.end?.includes(fmtDate(yesterday))) {{
+      throw new Error(`时间范围填入后回读不一致: ${{JSON.stringify(values)}}，期望 ${{startText}} ~ ${{endText}}`);
+    }}
+    return true;
+  }}
+
   async function queryAndDownloadOrderDetails(timeType) {{
     await switchTimeType(timeType);
+    await selectTimeRange();
     await sleep(1200);
     await clickQueryIfPresent();
-    await sleep(12000);
+    await sleep(20000);
     await waitForSlider(`交易订单明细_${{timeType}}`);
     await clickOrderDetailsDownload(`直播间成交订单明细_${{timeType}}`);
     await sleep(3000);
@@ -521,8 +571,11 @@ async (page) => {{
     await waitForSlider('交易分析-订单明细');
     const tab = page.locator('[role="tab"]').filter({{ hasText: '订单明细' }}).first();
     if (await tab.isVisible({{ timeout: 5000 }}).catch(() => false)) {{
-      await tab.click({{ timeout: 20000 }});
-      await page.waitForURL(url => url.href.includes('page=OrderDetail'), {{ timeout: 20000 }}).catch(() => null);
+      const already = await tab.getAttribute('aria-selected').catch(() => null);
+      if (already !== 'true') {{
+        await tab.click({{ timeout: 20000 }});
+        await page.waitForURL(url => url.href.includes('page=OrderDetail'), {{ timeout: 20000 }}).catch(() => null);
+      }}
     }}
     await sleep(6000);
     const section = page.locator('.tta-order-details').first();
