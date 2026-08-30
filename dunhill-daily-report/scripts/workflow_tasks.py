@@ -125,6 +125,10 @@ def _files_matching(download_dir: Path, task_id: str, before: set[Path]) -> list
 
 def _error_type(output: str) -> str:
     lowered = output.lower()
+    # 控件定位失败是前端改版/时序问题，与登录无关，须先于 auth 关键词判断，
+    # 否则日志里偶现“登录”字样会被误标为 auth_required
+    if "内不可点击" in output or "控件 " in output:
+        return "ui_change"
     if any(marker in lowered for marker in ("login", "auth", "登录", "cookie")):
         return "auth_required"
     if any(marker in lowered for marker in ("timeout", "timed out", "connection", "net::err")):

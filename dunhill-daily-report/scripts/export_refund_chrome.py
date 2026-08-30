@@ -413,31 +413,6 @@ async (page) => {{
     confirm:        {{ ids: [], texts: ['确认', '确定'] }},
   }};
 
-  function findControlInDom(control) {{
-    const norm = t => String(t || '').replace(/\\s+/g, '');
-    for (const id of control.ids || []) {{
-      const el = document.querySelector(`#${{id}}`);
-      if (el && el.offsetParent !== null) return el;
-    }}
-    const texts = new Set((control.texts || []).map(norm));
-    let divFallback = null;
-    // querySelectorAll 文档序返回：先出现的同名 button 先命中
-    for (const el of document.querySelectorAll('button, [role="button"], a')) {{
-      if (el.offsetParent === null) continue;
-      if (!texts.has(norm(el.textContent))) continue;
-      return el;
-    }}
-    for (const el of document.querySelectorAll('div')) {{
-      if (el.offsetParent === null) continue;
-      const text = norm(el.textContent);
-      if (!texts.has(text)) continue;
-      const isLeaf = el.children.length === 0
-        || [...el.children].every(c => norm(c.textContent) === text);
-      if (isLeaf) {{ divFallback = divFallback || el; }}
-    }}
-    return divFallback;
-  }}
-
   function controlDiag() {{
     // 现场取证：改版后把这份清单贴出来就能定位新按钮叫什么
     const seen = new Set();
@@ -465,8 +440,8 @@ async (page) => {{
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {{
       const clicked = await targetPage.evaluate(ctrl => {{
+        const norm = t => String(t || '').replace(/\\s+/g, '');
         const findEl = (c) => {{
-          const norm = t => String(t || '').replace(/\\s+/g, '');
           for (const id of c.ids || []) {{
             const el = document.querySelector('#' + id);
             if (el && el.offsetParent !== null) return el;
@@ -488,13 +463,17 @@ async (page) => {{
         }};
         const el = findEl(ctrl);
         if (!el) return null;
+        const cls = String(el.className?.baseVal ?? el.className ?? '');
         const disabled = el.disabled === true
           || el.getAttribute('aria-disabled') === 'true'
-          || (el.className || '').includes('disabled');
-        if (disabled) return {{ blocked: 'disabled', classList: el.className }};
+          || cls.includes('disabled');
+        if (disabled) return {{ blocked: 'disabled', classList: cls }};
         el.click();
         return {{ clicked: norm(el.textContent) }};
-      }}, control).catch(() => null);
+      }}, control).catch(err => ({{ error: String(err).slice(0, 200) }}));
+      if (clicked && clicked.error) {{
+        throw new Error(`控件 ${{name}} evaluate 内部异常: ${{clicked.error}}`);
+      }}
       if (clicked && clicked.clicked) {{
         console.log(`[INFO] 已点击 ${{name}}(${{clicked.clicked}})。`);
         return clicked.clicked;
