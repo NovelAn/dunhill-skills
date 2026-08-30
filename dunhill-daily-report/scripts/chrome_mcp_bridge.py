@@ -645,3 +645,42 @@ def run_in_local_chrome(code: str, timeout: int = 240, client_name: str = "dunhi
         return client.run_code(code, timeout=timeout)
     finally:
         client.close()
+
+
+class ChromeSession:
+    """整个脚本进程共享一个 MCP 连接；断连自动重启一次。
+
+    之前每个阶段/源都新起一次 MCP 进程（node 启动 + 扩展握手 + connect.html 授权），
+    一次 DAG 全流程要起十几次。共享后每脚本只握手一次。
+    """
+
+    def __init__(self, timeout: int = 240, client_name: str = "dunhill-chrome-bridge") -> None:
+        self.timeout = timeout
+        self.client_name = client_name
+        self._client: PlaywrightMCPClient | None = None
+
+    def run(self, code: str, timeout: int | None = None) -> str:
+        load_env()
+        for attempt in (1, 2):
+            if self._client is None:
+                self._client = PlaywrightMCPClient(timeout=self.timeout, client_name=self.client_name)
+                self._client.start()
+            try:
+                return self._client.run_code(code, timeout=timeout or self.timeout)
+            except MCPError as error:
+                # 页面级错误以 "### Error" 文本返回，不会走到这里；MCPError 是传输层断连，重起一次
+                if attempt == 2:
+                    raise
+                print(f"[bridge][WARN] MCP 连接中断（{str(error)[:120]}），重启连接重试...")
+                self.close()
+
+    def close(self) -> None:
+        if self._client:
+            self._client.close()
+            self._client = None
+
+    def __enter__(self) -> "ChromeSession":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()

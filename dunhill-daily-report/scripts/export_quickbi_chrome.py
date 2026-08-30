@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from chrome_mcp_bridge import load_env, run_in_local_chrome
+from chrome_mcp_bridge import ChromeSession, load_env, run_in_local_chrome
 
 
 DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
@@ -584,14 +584,19 @@ def run_chrome_action(
     action: str,
     timeout: int,
     source_overrides: dict[str, object] | None = None,
+    session: ChromeSession | None = None,
 ) -> dict[str, object] | None:
     source: dict[str, object] = {**QUICKBI_SOURCES[key], **(source_overrides or {})}
     try:
-        output = run_in_local_chrome(
-            quickbi_action_code(source, action),
-            timeout=timeout,
-            client_name=f"dunhill-quickbi-{action}-{key}",
-        )
+        code = quickbi_action_code(source, action)
+        if session is not None:
+            output = session.run(code, timeout=timeout)
+        else:
+            output = run_in_local_chrome(
+                code,
+                timeout=timeout,
+                client_name=f"dunhill-quickbi-{action}-{key}",
+            )
     except Exception as exc:
         print(f"[FAIL] {source['label']} {action} 阶段 MCP 执行失败: {exc}")
         return None
@@ -626,6 +631,21 @@ def run_batch(source_keys: list[str], timeout: int) -> bool:
     task_started_at: dict[str, float] = {}
     failed: list[str] = []
 
+    # 所有源/阶段共享一个 MCP 连接（此前每次 create/download/重试都新起一次 MCP 进程）
+    with ChromeSession(timeout=timeout, client_name="dunhill-quickbi-export") as session:
+        result_all = _run_batch_inner(source_keys, timeout, session, created, ready_at, task_started_at, failed)
+    return result_all
+
+
+def _run_batch_inner(
+    source_keys: list[str],
+    timeout: int,
+    session: ChromeSession,
+    created: dict[str, dict[str, object]],
+    ready_at: dict[str, float],
+    task_started_at: dict[str, float],
+    failed: list[str],
+) -> bool:
     for key in source_keys:
         source = QUICKBI_SOURCES[key]
         print("\n" + "-" * 60)
@@ -639,6 +659,7 @@ def run_batch(source_keys: list[str], timeout: int) -> bool:
             "create",
             timeout=timeout,
             source_overrides={"min_task_created_epoch_ms": int(start * 1000)},
+            session=session,
         )
         if not result or not result.get("ok"):
             failed.append(key)
@@ -675,6 +696,7 @@ def run_batch(source_keys: list[str], timeout: int) -> bool:
                 source_overrides={
                     "min_task_created_epoch_ms": int(task_started_at[key] * 1000),
                 },
+                session=session,
             )
             if last_result and last_result.get("ok"):
                 downloaded = wait_for_download(source["prefix"], click_started_at, timeout=180)

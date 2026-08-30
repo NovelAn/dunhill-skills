@@ -96,6 +96,51 @@ async (page) => {{
     return String(text || '').replace(/\\s+/g, '').trim();
   }}
 
+  const sliderSelectors = [
+    '#nc_1_wrapper',
+    '#nc_1__scale_text',
+    '.nc_wrapper',
+    '.nc_scale',
+    '[id*="nocaptcha"]',
+    '[class*="nocaptcha"]',
+    '[id*="captcha"]',
+    '.baxia-dialog',
+    '.J_MIDDLEWARE_FRAME_WIDGET',
+  ];
+
+  // 与 export_live.py waitForSlider 相同的滑块等待：检测到滑块就等用户手动完成。
+  // （2026-08-30 refund_export 失败：搜索售后单后弹滑块，脚本不识别，直接找批量导出 30s 超时）
+  async function waitForSlider(label) {{
+    for (let i = 0; i < 8; i++) {{
+      const found = await page.evaluate(selectors => {{
+        for (const sel of selectors) {{
+          const el = document.querySelector(sel);
+          if (el && el.offsetParent !== null) return sel;
+        }}
+        const middleware = document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET');
+        if (middleware && middleware.offsetParent !== null) return '.J_MIDDLEWARE_FRAME_WIDGET';
+        return null;
+      }}, sliderSelectors).catch(() => null);
+      if (!found) {{
+        await sleep(1000);
+        continue;
+      }}
+      console.log(`[WARN] ${{label}} 检测到滑块验证码(${{found}})，请在 Chrome 中手动完成。`);
+      for (let j = 0; j < 180; j++) {{
+        await sleep(1000);
+        const stillThere = await page.evaluate(sel => {{
+          const el = document.querySelector(sel);
+          return !!(el && el.offsetParent !== null);
+        }}, found).catch(() => false);
+        if (!stillThere) {{
+          await sleep(2000);
+          return;
+        }}
+      }}
+      throw new Error(`${{label}} 滑块验证等待超时`);
+    }}
+  }}
+
   async function clickByText(texts, selector = 'button, a, [role="button"], .next-menu-item') {{
     const result = await page.evaluate(({{ texts, selector }}) => {{
       const normalize = text => String(text || '').replace(/\\s+/g, '').trim();
@@ -350,6 +395,7 @@ async (page) => {{
       await page.goto(refundUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
       await sleep(2500);
     }}
+    await waitForSlider('批量导出前');
     await clickButtonExact('批量导出');
     await sleep(1000);
 
@@ -394,21 +440,32 @@ async (page) => {{
   }}
 
   async function clickLoginSubmit(frame) {{
-    const selectors = [
-      'button[type="submit"]',
-      '.fm-button',
-      '#login-form button',
-      'button:has-text("登录")',
-      'a:has-text("登录")',
-      '[role="button"]:has-text("登录")',
-    ];
-    for (const selector of selectors) {{
-      const locator = frame.locator(selector).first();
-      if (await locator.isVisible({{ timeout: 1000 }}).catch(() => false)) {{
-        await locator.click({{ timeout: 10000 }});
-        return selector;
+    // 先激活"密码登录" tab（默认是扫码登录，密码面板不点 tab 是隐藏的）
+    await frame.evaluate(() => {{
+      for (const tab of document.querySelectorAll('.fm-tab, [role="tab"], li, a, span')) {{
+        const text = tab.textContent?.trim();
+        if (tab.offsetParent !== null && ['密码登录', '账号密码登录'].includes(text)) {{
+          tab.click();
+          return true;
+        }}
       }}
-    }}
+      return false;
+    }}).catch(() => false);
+    await sleep(1200);
+
+    // 用 JS 直接触发点击，绕过 Playwright 对 iframe 内元素"可见/稳定"的严格检查
+    // （2026-08-30 refund_export 失败：登录后批量导出按钮未出现，登录提交疑似同因）
+    const clicked = await frame.evaluate(() => {{
+      for (const btn of document.querySelectorAll('button[type="submit"], .fm-button, #login-form button')) {{
+        if (btn.offsetParent !== null || btn.getClientRects().length > 0) {{
+          btn.click();
+          return btn.className || 'submit-button';
+        }}
+      }}
+      return null;
+    }}).catch(() => null);
+    if (clicked) return `js-click:${{clicked}}`;
+
     await frame.keyboard.press('Enter');
     return 'keyboard-enter';
   }}
@@ -527,10 +584,13 @@ async (page) => {{
   }}
 
   await ensureRefundPage();
+  await waitForSlider('退款列表页');
   const statusText = await selectAllRefundStatus();
 
   await clickByText(['搜索售后单']);
-  await sleep(5000);
+  await sleep(2000);
+  await waitForSlider('搜索售后单');
+  await sleep(3000);
   const totalCount = await page.evaluate(() => {{
     const match = document.body.innerText.match(/已选\\s*\\(0\\/(\\d+)\\)/);
     return match ? Number(match[1]) : null;

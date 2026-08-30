@@ -21,7 +21,24 @@ import sys
 import time
 from pathlib import Path
 
-from chrome_mcp_bridge import load_env, run_in_local_chrome
+from chrome_mcp_bridge import ChromeSession, load_env, run_in_local_chrome
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "dunhill-config.yaml"
+
+
+def load_taobao_credentials() -> tuple[str, str]:
+    """与 export_refund_chrome.py 相同的凭据加载：环境变量优先，回退 config yaml。"""
+    import re
+
+    load_env()
+    username = os.environ.get("TAOBAO_USERNAME", "").strip()
+    if not username and CONFIG_PATH.exists():
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+        match = re.search(r'^\s*taobao_username:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+        if match:
+            username = match.group(1).strip()
+    password = os.environ.get("TAOBAO_PASSWORD", "").strip()
+    return username, password
 
 
 OVERVIEW_URL = "https://liveplatform.taobao.com/restful/index/live/overview?forceShowLegacyVersion=true"
@@ -152,6 +169,7 @@ def live_export_code(mode: str = "all", attach_current: bool = False) -> str:
     transaction_url = json.dumps(TRANSACTION_URL)
     mode_json = json.dumps(mode)
     attach_json = "true" if attach_current else "false"
+    username, password = load_taobao_credentials()
     return f"""
 async (page) => {{
   const downloadDir = {download_dir};
@@ -160,6 +178,8 @@ async (page) => {{
   const transactionUrl = {transaction_url};
   const mode = {mode_json};
   const attachCurrent = {attach_json};
+  const taobaoUsername = {json.dumps(username)};
+  const taobaoPassword = {json.dumps(password)};
   const sleep = ms => page.waitForTimeout(ms);
   const sliderSelectors = [
     '#nc_1_wrapper',
@@ -198,6 +218,110 @@ async (page) => {{
     if (page.url().toLowerCase().includes('login')) {{
       throw new Error(`${{label}} 跳转到登录页：Playwright Extension 没有复用到已登录 Chrome。请先在本机 Chrome 登录淘宝直播平台，再重试。`);
     }}
+  }}
+
+  async function findLoginFrame() {{
+    for (let i = 0; i < 20; i++) {{
+      for (const frame of page.frames()) {{
+        const passwordInput = frame
+          .locator('input[type="password"], input[name="fm-login-password"], #fm-login-password')
+          .first();
+        if (await passwordInput.isVisible({{ timeout: 300 }}).catch(() => false)) {{
+          return frame;
+        }}
+      }}
+      await sleep(500);
+    }}
+    return null;
+  }}
+
+  async function fillFirstVisible(frame, selectors, value, label) {{
+    for (const selector of selectors) {{
+      const locator = frame.locator(selector).first();
+      if (await locator.isVisible({{ timeout: 1000 }}).catch(() => false)) {{
+        await locator.fill(value, {{ timeout: 10000 }});
+        return selector;
+      }}
+    }}
+    throw new Error(`登录页上找不到 ${{label}} 输入框。`);
+  }}
+
+  async function clickLoginSubmit(frame) {{
+    // 先激活"密码登录" tab（默认是扫码登录，密码面板不点 tab 是隐藏的）
+    await retryEvaluate(() => {{
+      for (const tab of document.querySelectorAll('.fm-tab, [role="tab"], li, a, span')) {{
+        const text = tab.textContent?.trim();
+        if (tab.offsetParent !== null && ['密码登录', '账号密码登录'].includes(text)) {{
+          tab.click();
+          return true;
+        }}
+      }}
+      return false;
+    }}, undefined, 'activate password tab').catch(() => false);
+    await sleep(1200);
+
+    // 用 JS 直接触发点击，绕过 Playwright 对 iframe 内元素"可见/稳定"的严格检查
+    // （2026-08-30 live_export 失败：locator.click 等 submit 按钮稳定 10s 超时）
+    const clicked = await retryEvaluate(() => {{
+      const doc = window.document;
+      for (const btn of doc.querySelectorAll('button[type="submit"], .fm-button, #login-form button')) {{
+        if (btn.offsetParent !== null || btn.getClientRects().length > 0) {{
+          btn.click();
+          return btn.className || 'submit-button';
+        }}
+      }}
+      return null;
+    }}, undefined, 'js click login submit');
+    if (clicked) return `js-click:${{clicked}}`;
+
+    await frame.keyboard.press('Enter');
+    return 'keyboard-enter';
+  }}
+
+  async function loginIfNeeded() {{
+    // 千牛/直播平台共用淘宝 SSO，与 export_refund_chrome.py 相同的账密自动登录
+    if (!page.url().toLowerCase().includes('login')) return false;
+    if (!taobaoUsername || !taobaoPassword) {{
+      throw new Error('直播平台跳到登录页，但未配置 TAOBAO_USERNAME/TAOBAO_PASSWORD，无法自动登录。请扫码登录后重跑。');
+    }}
+    console.log('[INFO] 检测到登录页，使用账密自动登录...');
+    const frame = await findLoginFrame();
+    if (!frame) {{
+      throw new Error('直播平台跳到登录页，但未找到密码输入框。');
+    }}
+    await fillFirstVisible(
+      frame,
+      [
+        'input[name="fm-login-id"]',
+        '#fm-login-id',
+        'input[name="loginId"]',
+        'input[autocomplete="username"]',
+        'input[type="text"]',
+      ],
+      taobaoUsername,
+      'username'
+    );
+    await fillFirstVisible(
+      frame,
+      [
+        'input[name="fm-login-password"]',
+        '#fm-login-password',
+        'input[name="password"]',
+        'input[autocomplete="current-password"]',
+        'input[type="password"]',
+      ],
+      taobaoPassword,
+      'password'
+    );
+    const submitSelector = await clickLoginSubmit(frame);
+    await page.waitForURL(url => !url.href.toLowerCase().includes('login'), {{ timeout: 90000 }}).catch(() => null);
+    await sleep(3000);
+    if (page.url().toLowerCase().includes('login')) {{
+      const text = await page.evaluate(() => document.body?.innerText?.slice(0, 1200) || '').catch(() => '');
+      throw new Error(`账密提交(${{submitSelector}})后仍未离开登录页，可能需要滑块或手机验证。页面文本: ${{text}}`);
+    }}
+    console.log('[OK] 自动登录成功，继续直播数据导出。');
+    return true;
   }}
 
   async function waitForSlider(label) {{
@@ -337,6 +461,11 @@ async (page) => {{
     }}
     console.log(`[INFO] ${{label}} 左侧导航不可用，使用 URL 打开目标页。`);
     await page.goto(targetUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
+    await sleep(2000);
+    await loginIfNeeded();
+    if (page.url().toLowerCase().includes('login')) {{
+      await page.goto(targetUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
+    }}
     await waitForMainContent(label, ['下载']);
   }}
 
@@ -648,7 +777,13 @@ def _files_from_today() -> list[Path]:
     ]
 
 
-def run_single_extension_stage(timeout: int, run_start_ts: float, mode: str, attach_current: bool) -> bool:
+def run_single_extension_stage(
+    timeout: int,
+    run_start_ts: float,
+    mode: str,
+    attach_current: bool,
+    session: ChromeSession | None = None,
+) -> bool:
     existing = verify_live_downloads(run_start_ts, mode=mode)
     if len(existing) < expected_file_count(mode):
         # 本次运行没有新增，但当天早些时候可能已下载成功（DAG 重试场景）——按文件名模式补认
@@ -679,11 +814,14 @@ def run_single_extension_stage(timeout: int, run_start_ts: float, mode: str, att
 
     try:
         print(f"[2/4] 已连接 MCP，准备运行 {mode} 下载流程...")
-        text = run_in_local_chrome(
-            live_export_code(mode=mode, attach_current=attach_current),
-            timeout=timeout,
-            client_name=f"dunhill-live-{mode}-export",
-        )
+        if session is not None:
+            text = session.run(live_export_code(mode=mode, attach_current=attach_current), timeout=timeout)
+        else:
+            text = run_in_local_chrome(
+                live_export_code(mode=mode, attach_current=attach_current),
+                timeout=timeout,
+                client_name=f"dunhill-live-{mode}-export",
+            )
         print("[3/4] 下载流程返回:")
         print(text)
         matched = wait_for_live_downloads(stage_start_ts, mode=mode)
@@ -734,19 +872,22 @@ def run_single_extension_stage(timeout: int, run_start_ts: float, mode: str, att
 def run_extension_export(timeout: int, run_start_ts: float, mode: str, attach_current: bool) -> bool:
     modes = STAGE_ORDER if mode == "all" else [mode]
     success = True
-    for stage in modes:
-        print()
-        print("-" * 60)
-        print(f"直播数据源阶段: {stage}")
-        print("-" * 60)
-        if not run_single_extension_stage(
-            timeout=timeout,
-            run_start_ts=run_start_ts,
-            mode=stage,
-            attach_current=attach_current,
-        ):
-            success = False
-            break
+    # 三个阶段共享一个 MCP 连接（此前每阶段各起一次，node 启动+扩展握手要重复三遍）
+    with ChromeSession(timeout=timeout, client_name="dunhill-live-export") as session:
+        for stage in modes:
+            print()
+            print("-" * 60)
+            print(f"直播数据源阶段: {stage}")
+            print("-" * 60)
+            if not run_single_extension_stage(
+                timeout=timeout,
+                run_start_ts=run_start_ts,
+                mode=stage,
+                attach_current=attach_current,
+                session=session,
+            ):
+                success = False
+                break
     return success
 
 
