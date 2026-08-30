@@ -96,7 +96,16 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         # "sycm_download",  # 已下线，取数源走 jycm_download.445603 → dunhill_tm取数源_backup
         *(f"quickbi_api.{source}" for source in QUICKBI_SOURCES),
     ]
-    reconciliation_tasks = []
+    # 订单侧源：解密/买家类型/分期只消费订单数据（千牛退款、直播订单、QuickBI 订单），
+    # 指标源（jycm 报表、直播大盘、quickbi 退款报表）挂了不该拖死它们——
+    # 2026-08-30 sycm 失败拖死整条尾部的事故即此耦合所致
+    order_side_sources = (
+        "refund_export",
+        "live_export",
+        "quickbi_api.tm_order",
+        "quickbi_api.dtc_order",
+    )
+    order_reconciles: tuple[str, ...] = ()
     for source_task in source_tasks:
         verify = f"source_verify.{source_task}"
         upload = f"targeted_upload.{source_task}"
@@ -110,10 +119,11 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         specs[verify] = TaskSpec(verify, deps=verify_deps, runner=runner(verify))
         specs[upload] = TaskSpec(upload, deps=(verify,), resources=("mysql_upload",), runner=runner(upload))
         specs[reconcile] = TaskSpec(reconcile, deps=(upload,), resources=("mysql_upload",), runner=runner(reconcile))
-        reconciliation_tasks.append(reconcile)
+        if source_task in order_side_sources:
+            order_reconciles += (reconcile,)
 
     specs["database_reconcile"] = TaskSpec(
-        "database_reconcile", deps=tuple(reconciliation_tasks), runner=runner("database_reconcile")
+        "database_reconcile", deps=order_reconciles, runner=runner("database_reconcile")
     )
     specs["unmask_buyer_nicknames"] = TaskSpec(
         "unmask_buyer_nicknames", deps=("database_reconcile",), resources=("mysql_upload",), runner=runner("unmask_buyer_nicknames")
