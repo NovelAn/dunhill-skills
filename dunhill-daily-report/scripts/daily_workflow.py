@@ -156,6 +156,28 @@ def current_run_dir() -> Path:
     return Path(os.environ.get("DUNHILL_RUN_DIR", str(RUNS_DIR / datetime.now().strftime("%Y-%m-%d"))))
 
 
+DATA_RELEASE_HOUR = 9  # T-1 数据约每天 9 点后释放（novel 2026-08-31 确认）
+
+
+def _stale_before_release(state: dict) -> bool:
+    """state 是不是"数据未释放时期"的产物。
+
+    凌晨调试跑出的 success 票根不能挡 9 点后的正式跑：T-1 数据还没出来时
+    拿到的文件是旧的（或被 data_not_ready 拒掉），9 点后必须全量重来。
+    判据：state 最后更新时间在今天释放时刻之前。
+    """
+    updated_at = state.get("updated_at")
+    if not updated_at:
+        return False
+    try:
+        last = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return False
+    now = datetime.now()
+    release_today = now.replace(hour=DATA_RELEASE_HOUR, minute=0, second=0, microsecond=0)
+    return last < release_today <= now
+
+
 def _task_step(task_id: str) -> str:
     # Step1 = 千牛退款 + 直播浏览器导出；quickbi_browser 是 Step2 QuickBI ≥50 行时的兜底，归 Step2
     if task_id in {"refund_export", "live_export"}:
@@ -275,7 +297,12 @@ def run_workflow(selected: set[str] | None = None) -> int:
     if selected is None and state_path.exists():
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
-            selected = _unfinished_tasks(previous, specs) or None
+            if _stale_before_release(previous):
+                print(
+                    f"[RESET] 今天 {DATA_RELEASE_HOUR}:00 前的运行结果已失效（T-1 数据 9 点后释放），全量重跑。"
+                )
+            else:
+                selected = _unfinished_tasks(previous, specs) or None
         except (OSError, json.JSONDecodeError):
             pass
     state = DagRunner(specs, state_path).run(selected=selected)
