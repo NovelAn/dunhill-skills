@@ -215,9 +215,23 @@ async (page) => {{
   }}
 
   async function assertLoggedIn(label) {{
-    if (page.url().toLowerCase().includes('login')) {{
+    // URL 在 login，或页内弹出 SSO iframe 登录层（URL 不变，2026-08-31 00:04 过期形态）
+    if (page.url().toLowerCase().includes('login') || (await inlineLoginFrame())) {{
       throw new Error(`${{label}} 跳转到登录页：Playwright Extension 没有复用到已登录 Chrome。请先在本机 Chrome 登录淘宝直播平台，再重试。`);
     }}
+  }}
+
+  async function inlineLoginFrame() {{
+    // 快速单趟探测页内登录层（任意 frame 中可见密码框，不轮询）
+    for (const frame of page.frames()) {{
+      const passwordInput = frame
+        .locator('input[type="password"], input[name="fm-login-password"], #fm-login-password')
+        .first();
+      if (await passwordInput.isVisible({{ timeout: 300 }}).catch(() => false)) {{
+        return frame;
+      }}
+    }}
+    return null;
   }}
 
   async function findLoginFrame() {{
@@ -279,13 +293,17 @@ async (page) => {{
   }}
 
   async function loginIfNeeded() {{
-    // 千牛/直播平台共用淘宝 SSO，与 export_refund_chrome.py 相同的账密自动登录
-    if (!page.url().toLowerCase().includes('login')) return false;
+    // 千牛/直播平台共用淘宝 SSO，与 export_refund_chrome.py 相同的账密自动登录。
+    // 触发条件：URL 跳到登录页，或页内出现 SSO 登录层（iframe 里有可见密码框）——
+    // 会话过期常只弹页内 iframe 登录层，URL 不变，纯 URL 检测是盲区
+    const onLoginUrl = page.url().toLowerCase().includes('login');
+    const inlineFrame = onLoginUrl ? null : await inlineLoginFrame();
+    if (!onLoginUrl && !inlineFrame) return false;
     if (!taobaoUsername || !taobaoPassword) {{
       throw new Error('直播平台跳到登录页，但未配置 TAOBAO_USERNAME/TAOBAO_PASSWORD，无法自动登录。请扫码登录后重跑。');
     }}
     console.log('[INFO] 检测到登录页，使用账密自动登录...');
-    const frame = await findLoginFrame();
+    const frame = inlineFrame || (await findLoginFrame());
     if (!frame) {{
       throw new Error('直播平台跳到登录页，但未找到密码输入框。');
     }}
@@ -314,14 +332,16 @@ async (page) => {{
       'password'
     );
     const submitSelector = await clickLoginSubmit(frame);
-    await page.waitForURL(url => !url.href.toLowerCase().includes('login'), {{ timeout: 90000 }}).catch(() => null);
-    await sleep(3000);
-    if (page.url().toLowerCase().includes('login')) {{
-      const text = await page.evaluate(() => document.body?.innerText?.slice(0, 1200) || '').catch(() => '');
-      throw new Error(`账密提交(${{submitSelector}})后仍未离开登录页，可能需要滑块或手机验证。页面文本: ${{text}}`);
+    // 成功判定：URL 离开 login（整页跳转），或页内密码框消失（iframe 登录层提交后 URL 不变）
+    for (let i = 0; i < 30; i++) {{
+      await sleep(3000);
+      if (!page.url().toLowerCase().includes('login') && !(await inlineLoginFrame())) {{
+        console.log('[OK] 自动登录成功，继续直播数据导出。');
+        return true;
+      }}
     }}
-    console.log('[OK] 自动登录成功，继续直播数据导出。');
-    return true;
+    const text = await page.evaluate(() => document.body?.innerText?.slice(0, 1200) || '').catch(() => '');
+    throw new Error(`账密提交(${{submitSelector}})后仍未离开登录页，可能需要滑块或手机验证。页面文本: ${{text}}`);
   }}
 
   async function waitForSlider(label) {{
@@ -463,7 +483,7 @@ async (page) => {{
     await page.goto(targetUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
     await sleep(2000);
     await loginIfNeeded();
-    if (page.url().toLowerCase().includes('login')) {{
+    if (page.url().toLowerCase().includes('login') || (await inlineLoginFrame())) {{
       await page.goto(targetUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
     }}
     await waitForMainContent(label, ['下载']);

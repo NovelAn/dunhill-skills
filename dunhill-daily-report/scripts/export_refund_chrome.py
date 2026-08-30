@@ -509,6 +509,20 @@ async (page) => {{
     return Date.now() - 60000;
   }}
 
+  async function inlineLoginFrame() {{
+    // 快速单趟探测页内登录层（任意 frame 中可见密码框，不轮询）。
+    // 千牛会话过期常不跳 login URL，只在页内弹 SSO 登录 iframe，URL 检测是盲区
+    for (const frame of page.frames()) {{
+      const passwordInput = frame
+        .locator('input[type="password"], input[name="fm-login-password"], #fm-login-password')
+        .first();
+      if (await passwordInput.isVisible({{ timeout: 300 }}).catch(() => false)) {{
+        return frame;
+      }}
+    }}
+    return null;
+  }}
+
   async function findLoginFrame() {{
     for (let i = 0; i < 20; i++) {{
       for (const frame of page.frames()) {{
@@ -567,12 +581,17 @@ async (page) => {{
   }}
 
   async function loginIfNeeded() {{
-    if (!page.url().toLowerCase().includes('login')) return false;
+    // 触发条件：URL 跳到登录页，或页内出现 SSO 登录层（iframe 里有可见密码框）。
+    // 2026-08-31 00:04 失败根因：千牛会话过期只弹页内 iframe 登录层，URL 不变，
+    // 旧条件 `url.includes('login')` 永不触发，自动账密登录从未兜底
+    const onLoginUrl = page.url().toLowerCase().includes('login');
+    const inlineFrame = onLoginUrl ? null : await inlineLoginFrame();
+    if (!onLoginUrl && !inlineFrame) return false;
     if (!taobaoUsername || !taobaoPassword) {{
       throw new Error('Refund page redirected to login, but Taobao username/password are not configured.');
     }}
 
-    const frame = await findLoginFrame();
+    const frame = inlineFrame || (await findLoginFrame());
     if (!frame) {{
       throw new Error('Refund page redirected to login, but no password input was found.');
     }}
@@ -602,13 +621,15 @@ async (page) => {{
       'password'
     );
     const submitSelector = await clickLoginSubmit(frame);
-    await page.waitForURL(url => !url.href.toLowerCase().includes('login'), {{ timeout: 90000 }}).catch(() => null);
-    await sleep(3000);
-    if (page.url().toLowerCase().includes('login')) {{
-      const text = await page.evaluate(() => document.body?.innerText?.slice(0, 1200) || '').catch(() => '');
-      throw new Error(`Taobao login did not complete after submitting credentials via ${{submitSelector}}. It may require slider or phone verification. Page text: ${{text}}`);
+    // 成功判定：URL 离开 login（整页跳转），或页内密码框消失（iframe 登录层提交后 URL 不变）
+    for (let i = 0; i < 30; i++) {{
+      await sleep(3000);
+      if (!page.url().toLowerCase().includes('login') && !(await inlineLoginFrame())) {{
+        return true;
+      }}
     }}
-    return true;
+    const text = await page.evaluate(() => document.body?.innerText?.slice(0, 1200) || '').catch(() => '');
+    throw new Error(`Taobao login did not complete after submitting credentials via ${{submitSelector}}. It may require slider or phone verification. Page text: ${{text}}`);
   }}
 
   async function ensureRefundPage() {{
@@ -616,7 +637,9 @@ async (page) => {{
       await page.goto(refundUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
     }}
     await sleep(3000);
-    if (page.url().toLowerCase().includes('login')) {{
+    // 登录检测三态：URL 在 login、或页内弹出 SSO iframe 登录层（URL 不变）、或都没有
+    const lookedLoggedOut = page.url().toLowerCase().includes('login') || !!(await inlineLoginFrame());
+    if (lookedLoggedOut) {{
       await loginIfNeeded();
       if (!page.url().includes('/trade-platform/refund-list')) {{
         await page.goto(refundUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
