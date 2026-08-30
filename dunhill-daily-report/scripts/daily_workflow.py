@@ -70,9 +70,12 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
     for report_id in JYCM_REPORTS:
         task_id = f"jycm_download.{report_id}"
         specs[task_id] = TaskSpec(task_id, deps=step1_sources, resources=("browser_downloads",), runner=runner(task_id))
-    specs["sycm_download"] = TaskSpec(
-        "sycm_download", deps=("taobao_auth_check", *step1_sources), resources=("chrome_mcp",), runner=runner("sycm_download")
-    )
+    # 2026-08-30 下线 sycm_download：sycm.taobao.com 直连 API 易触发风控，取数源统一走
+    # jycm_download.445603（lydaas 报表下载）→ dunhill_tm取数源_backup。
+    # 若需恢复：取消下一行注释并在 source_tasks 里加回 "sycm_download"。
+    # specs["sycm_download"] = TaskSpec(
+    #     "sycm_download", deps=("taobao_auth_check", *step1_sources), resources=("chrome_mcp",), runner=runner("sycm_download")
+    # )
     for source in QUICKBI_SOURCES:
         # quickbi_crawler 锁：manage.py quickbi 一次抓全部 5 个源，并行跑会并发写同一批文件
         # （2026-08-22 verify glob 落空的根源）。串行后第一个跑完整爬虫，其余看到文件即秒回。
@@ -90,7 +93,7 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         "refund_export",  # 千牛后台退款导出（主退款源，必须每天入库）
         "live_export",  # 直播大盘/场次/订单明细
         *(f"jycm_download.{report_id}" for report_id in JYCM_REPORTS),
-        "sycm_download",
+        # "sycm_download",  # 已下线，取数源走 jycm_download.445603 → dunhill_tm取数源_backup
         *(f"quickbi_api.{source}" for source in QUICKBI_SOURCES),
     ]
     reconciliation_tasks = []

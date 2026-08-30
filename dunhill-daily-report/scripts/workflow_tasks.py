@@ -200,7 +200,9 @@ def run_step1_task(task_id: str, root_dir: Path, download_dir: Path, timeout: in
     if result.returncode != 0:
         return TaskResult.failed(task_id, _error_type(output), retryable=_error_type(output) == "transient_network", evidence={"exit_code": result.returncode, "log_tail": output[-1000:]})
     if outputs:
-        return TaskResult.success(task_id, outputs=[str(path) for path in outputs], evidence={"new_files": len(outputs), "duration_seconds": round(time.time() - started, 2)})
+        # log_tail 留存：2026-08-30 live_export session 阶段静默空手但整体 success，
+        # 内部 stdout 被丢弃导致无法回溯——成功路径也留最后 1500 字符
+        return TaskResult.success(task_id, outputs=[str(path) for path in outputs], evidence={"new_files": len(outputs), "duration_seconds": round(time.time() - started, 2), "log_tail": output[-1500:]})
     if task_id.startswith("quickbi_browser."):
         # 脚本正常退出但没有新文件 = 页面查询为空（如 dtc_refund 近期无退款），正常业务结果
         return TaskResult.no_data(task_id, evidence={"rows": 0, "confirmed_by": "browser_export"})
