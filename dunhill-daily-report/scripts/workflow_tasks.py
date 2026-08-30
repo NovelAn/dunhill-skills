@@ -129,6 +129,11 @@ def _error_type(output: str) -> str:
     # 否则日志里偶现“登录”字样会被误标为 auth_required
     if "内不可点击" in output or "控件 " in output:
         return "ui_change"
+    # 页面元素点击/等待超时（Playwright locator）。登录态失效也会表现成元素点不动，
+    # 但 auth 判断交给 taobao_auth_check gate，这里如实归类为 ui 问题。
+    # （2026-08-31 refund/live 的 TimeoutError 被完整输出前段的 auth 字样误标）
+    if "TimeoutError" in output or "locator.click" in lowered or "locator resolved" in lowered:
+        return "ui_timeout"
     if any(marker in lowered for marker in ("login", "auth", "登录", "cookie")):
         return "auth_required"
     if any(marker in lowered for marker in ("timeout", "timed out", "connection", "net::err")):
