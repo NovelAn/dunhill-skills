@@ -69,7 +69,9 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
 
     for report_id in JYCM_REPORTS:
         task_id = f"jycm_download.{report_id}"
-        specs[task_id] = TaskSpec(task_id, deps=step1_sources, resources=("browser_downloads",), runner=runner(task_id))
+        # 前置只等 refund（Downloads 混流防护；与 live 的 browser_downloads 互斥已由资源锁保证）。
+        # 若继续依赖 live_export，直播偶发失败会拖死取数源断更（2026-08-19 场次源断更同构）
+        specs[task_id] = TaskSpec(task_id, deps=("refund_export",), resources=("browser_downloads",), runner=runner(task_id))
     # 2026-08-30 下线 sycm_download：sycm.taobao.com 直连 API 易触发风控，取数源统一走
     # jycm_download.445603（lydaas 报表下载）→ dunhill_tm取数源_backup。
     # 若需恢复：取消下一行注释并在 source_tasks 里加回 "sycm_download"。
@@ -79,8 +81,10 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
     for source in QUICKBI_SOURCES:
         # quickbi_crawler 锁：manage.py quickbi 一次抓全部 5 个源，并行跑会并发写同一批文件
         # （2026-08-22 verify glob 落空的根源）。串行后第一个跑完整爬虫，其余看到文件即秒回。
+        # 前置只等 refund：quickbi 订单是尾部任务（解密/买家类型/分期）的输入，
+        # 不依赖 live_export——直播挂了不该拖死订单侧整条链（2026-08-30 拆门延续）
         specs[f"quickbi_api.{source}"] = TaskSpec(
-            f"quickbi_api.{source}", deps=step1_sources, resources=("quickbi_crawler",), runner=runner(f"quickbi_api.{source}")
+            f"quickbi_api.{source}", deps=("refund_export",), resources=("quickbi_crawler",), runner=runner(f"quickbi_api.{source}")
         )
     for source in QUICKBI_SOURCES:
         # quickbi_browser 是 quickbi_api 的兜底（预览 50 行上限，超过则浏览器导出全量）；
@@ -96,12 +100,11 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         # "sycm_download",  # 已下线，取数源走 jycm_download.445603 → dunhill_tm取数源_backup
         *(f"quickbi_api.{source}" for source in QUICKBI_SOURCES),
     ]
-    # 订单侧源：解密/买家类型/分期只消费订单数据（千牛退款、直播订单、QuickBI 订单），
-    # 指标源（jycm 报表、直播大盘、quickbi 退款报表）挂了不该拖死它们——
+    # 订单侧源：解密/买家类型/分期只消费订单数据（千牛退款、QuickBI 天猫/DTC 订单），
+    # 直播与指标源（jycm 报表、直播下载、quickbi 退款报表）挂了不该拖死它们——
     # 2026-08-30 sycm 失败拖死整条尾部的事故即此耦合所致
     order_side_sources = (
         "refund_export",
-        "live_export",
         "quickbi_api.tm_order",
         "quickbi_api.dtc_order",
     )
