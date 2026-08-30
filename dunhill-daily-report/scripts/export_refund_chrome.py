@@ -81,6 +81,10 @@ def refund_export_code(attach_current: bool, username: str, password: str) -> st
     taobao_username = json.dumps(username)
     taobao_password = json.dumps(password)
     attach = "true" if attach_current else "false"
+    # 失败截图存当日 runs 目录，改版排查用
+    shot_dir = Path(__file__).resolve().parent.parent / "runs" / time.strftime("%Y-%m-%d")
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    shot_path = str(shot_dir / "refund_fail.png")
     return f"""
 async (page) => {{
   const refundUrl = {refund_url};
@@ -88,6 +92,7 @@ async (page) => {{
   const downloadDir = {download_dir};
   const taobaoUsername = {taobao_username};
   const taobaoPassword = {taobao_password};
+  const failShotPath = {json.dumps(shot_path)};
   const attachCurrent = {attach};
   const today = new Date().toISOString().slice(0, 10);
   const sleep = ms => page.waitForTimeout(ms);
@@ -213,18 +218,20 @@ async (page) => {{
       const containers = [
         ...document.querySelectorAll('[role="dialog"], .next-dialog, .next-overlay-wrapper'),
       ];
+      const confirmTexts = ['确认', '确定'];
+      const isConfirm = btn => confirmTexts.includes(btn.textContent.trim().replace(/\\s+/g, ''));
       for (const container of containers) {{
         if (container.offsetParent === null) continue;
         if (!container.textContent.includes('用户个人信息')) continue;
         for (const btn of container.querySelectorAll('button')) {{
-          if (btn.textContent.trim() === '确认') {{
+          if (isConfirm(btn)) {{
             btn.click();
             return true;
           }}
         }}
       }}
       for (const btn of document.querySelectorAll('button')) {{
-        if (btn.offsetParent !== null && btn.textContent.trim() === '确认') {{
+        if (btn.offsetParent !== null && isConfirm(btn)) {{
           btn.click();
           return true;
         }}
@@ -308,6 +315,12 @@ async (page) => {{
           Number(second)
         ).getTime();
       }};
+      // 下载报表按钮文本走 CONTROLS.downloadReport 别名集合（抗改版）
+      const dlTexts = {json.dumps(['下载退款单报表', '下载报表', '下载'])};
+      const isDownloadBtn = btn => {{
+        const t = btn.textContent.trim().replace(/\\s+/g, '');
+        return dlTexts.some(a => t === a.replace(/\\s+/g, ''));
+      }};
       const reportContainer = button => {{
         const directRow = button.closest('tr, .next-table-row, .next-table-row-wrapper, .next-table-row-inner');
         if (directRow && directRow.textContent.includes('报表申请时间：')) return directRow;
@@ -317,7 +330,7 @@ async (page) => {{
           const text = node.textContent || '';
           if (text.includes('报表申请时间：')) {{
             const downloadCount = [...node.querySelectorAll('button')]
-              .filter(btn => btn.offsetParent !== null && btn.textContent.trim() === '下载退款单报表')
+              .filter(btn => btn.offsetParent !== null && isDownloadBtn(btn))
               .length;
             if (downloadCount === 1) return node;
             fallback = fallback || node;
@@ -330,7 +343,7 @@ async (page) => {{
       const candidates = [];
       for (let index = 0; index < buttons.length; index += 1) {{
         const btn = buttons[index];
-        if (btn.textContent.trim() !== '下载退款单报表') continue;
+        if (!isDownloadBtn(btn)) continue;
         const container = reportContainer(btn);
         const text = container?.textContent || '';
         const reportTimeMs = parseReportTimeMs(text);
@@ -363,15 +376,13 @@ async (page) => {{
       return targetPage;
     }}
 
-    const visibleButtons = await getVisibleButtons(targetPage);
-    if (visibleButtons.includes('批量导出')) {{
-      await clickButtonExact('批量导出', targetPage);
-      await sleep(1500);
-    }}
+    // 导出入口尝试点一次（新版是 div"导出"，旧版 button"批量导出"）；失败静默，后面走 URL 直达
+    await clickControl('exportEntry', targetPage, 8000).catch(() => null);
+    await sleep(1500);
 
     const buttonsAfterExport = await getVisibleButtons(targetPage);
-    if (buttonsAfterExport.includes('查看已生成报表')) {{
-      await clickButtonExact('查看已生成报表', targetPage);
+    if (buttonsAfterExport.some(t => CONTROLS.viewReports.texts.includes(t))) {{
+      await clickControl('viewReports', targetPage, 15000);
       await sleep(1000);
       await confirmPrivacy(targetPage);
       await sleep(2500);
@@ -390,27 +401,133 @@ async (page) => {{
     return targetPage;
   }}
 
+  // ===== 控件注册表：抗千牛前端改版 =====
+  // 定位优先级：语义 id ＞ 精确文本别名 ＞ 叶子 div 文本兜底。
+  // 改版通常只动文案不动功能，新文案出现时往 aliases 里加一行即可，代码不用动。
+  const CONTROLS = {{
+    search:         {{ ids: [], texts: ['搜索售后单', '搜索'] }},
+    exportEntry:    {{ ids: ['guide_export_link'], texts: ['导出', '批量导出'] }},
+    generate:       {{ ids: [], texts: ['生成报表', '生成'] }},
+    viewReports:    {{ ids: [], texts: ['查看已生成报表', '已生成报表', '查看报表'] }},
+    downloadReport: {{ ids: [], texts: ['下载退款单报表', '下载报表', '下载'] }},
+    confirm:        {{ ids: [], texts: ['确认', '确定'] }},
+  }};
+
+  function findControlInDom(control) {{
+    const norm = t => String(t || '').replace(/\\s+/g, '');
+    for (const id of control.ids || []) {{
+      const el = document.querySelector(`#${{id}}`);
+      if (el && el.offsetParent !== null) return el;
+    }}
+    const texts = new Set((control.texts || []).map(norm));
+    let divFallback = null;
+    // querySelectorAll 文档序返回：先出现的同名 button 先命中
+    for (const el of document.querySelectorAll('button, [role="button"], a')) {{
+      if (el.offsetParent === null) continue;
+      if (!texts.has(norm(el.textContent))) continue;
+      return el;
+    }}
+    for (const el of document.querySelectorAll('div')) {{
+      if (el.offsetParent === null) continue;
+      const text = norm(el.textContent);
+      if (!texts.has(text)) continue;
+      const isLeaf = el.children.length === 0
+        || [...el.children].every(c => norm(c.textContent) === text);
+      if (isLeaf) {{ divFallback = divFallback || el; }}
+    }}
+    return divFallback;
+  }}
+
+  function controlDiag() {{
+    // 现场取证：改版后把这份清单贴出来就能定位新按钮叫什么
+    const seen = new Set();
+    const texts = [];
+    for (const el of document.querySelectorAll('button, [role="button"], a')) {{
+      if (el.offsetParent === null) continue;
+      const label = el.textContent.trim().replace(/\\s+/g, ' ');
+      if (!label || label.length > 12 || seen.has(label)) continue;
+      seen.add(label);
+      texts.push(label);
+    }}
+    return {{
+      url: location.href.slice(0, 120),
+      hasCount: /已选\\s*\\(\\d+\\/\\d+\\)/.test(document.body.innerText),
+      sliderHit: ['#nc_1_wrapper','.nc_wrapper','.nc_scale','.baxia-dialog','[id*="captcha"]']
+        .filter(sel => {{ const el = document.querySelector(sel); return el && el.offsetParent !== null; }}),
+      clickableTexts: texts.slice(0, 40),
+    }};
+  }}
+
+  // 轮询等控件出现并 JS click。等不到时 dump 现场清单 + 截图，抛错带完整上下文。
+  async function clickControl(name, targetPage = page, timeoutMs = 30000) {{
+    const control = CONTROLS[name];
+    if (!control) throw new Error(`Unknown control: ${{name}}`);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {{
+      const clicked = await targetPage.evaluate(ctrl => {{
+        const findEl = (c) => {{
+          const norm = t => String(t || '').replace(/\\s+/g, '');
+          for (const id of c.ids || []) {{
+            const el = document.querySelector('#' + id);
+            if (el && el.offsetParent !== null) return el;
+          }}
+          const texts = new Set((c.texts || []).map(norm));
+          for (const el of document.querySelectorAll('button, [role="button"], a')) {{
+            if (el.offsetParent === null) continue;
+            if (texts.has(norm(el.textContent))) return el;
+          }}
+          for (const el of document.querySelectorAll('div')) {{
+            if (el.offsetParent === null) continue;
+            const text = norm(el.textContent);
+            if (!texts.has(text)) continue;
+            const isLeaf = el.children.length === 0
+              || [...el.children].every(ch => norm(ch.textContent) === text);
+            if (isLeaf) return el;
+          }}
+          return null;
+        }};
+        const el = findEl(ctrl);
+        if (!el) return null;
+        const disabled = el.disabled === true
+          || el.getAttribute('aria-disabled') === 'true'
+          || (el.className || '').includes('disabled');
+        if (disabled) return {{ blocked: 'disabled', classList: el.className }};
+        el.click();
+        return {{ clicked: norm(el.textContent) }};
+      }}, control).catch(() => null);
+      if (clicked && clicked.clicked) {{
+        console.log(`[INFO] 已点击 ${{name}}(${{clicked.clicked}})。`);
+        return clicked.clicked;
+      }}
+      if (clicked && clicked.blocked) {{
+        console.log(`[WARN] ${{name}} 存在但被禁用(${{clicked.classList}})，等待恢复...`);
+      }}
+      await sleep(1500);
+    }}
+    const diag = await targetPage.evaluate(controlDiag).catch(err => ({{ diagFailed: String(err).slice(0, 100) }}));
+    let screenshot = '';
+    try {{
+      await targetPage.screenshot({{ path: failShotPath }});
+      screenshot = failShotPath;
+    }} catch {{}}
+    throw new Error(`控件 ${{name}}（候选: ${{JSON.stringify(control.texts)}}）${{Math.round(timeoutMs/1000)}}s 内不可点击。现场: ${{JSON.stringify(diag)}} 截图: ${{screenshot || '失败'}}`);
+  }}
+
   async function generateReportFromRefundList() {{
     if (!page.url().includes('/trade-platform/refund-list')) {{
       await page.goto(refundUrl, {{ waitUntil: 'domcontentloaded', timeout: 60000 }});
       await sleep(2500);
     }}
     await waitForSlider('批量导出前');
-    await clickButtonExact('批量导出');
-    await sleep(1000);
+    await clickControl('exportEntry');
+    await sleep(1500);
 
-    if (!await hasVisibleButton('生成报表', page, 15000)) {{
-      const buttonsBeforeGenerate = await getVisibleButtons(page);
-      throw new Error(`导出弹窗未出现，无法点击生成报表。可见按钮: ${{JSON.stringify(buttonsBeforeGenerate)}}`);
-    }}
-
-    const generationStartedAtMs = Date.now() - 60000;
-    await clickButtonExact('生成报表');
+    await clickControl('generate');
     await sleep(1200);
     await confirmPrivacy();
     await page.keyboard.press('Escape').catch(() => {{}});
     await sleep(1000);
-    return generationStartedAtMs;
+    return Date.now() - 60000;
   }}
 
   async function findLoginFrame() {{
@@ -587,10 +704,23 @@ async (page) => {{
   await waitForSlider('退款列表页');
   const statusText = await selectAllRefundStatus();
 
-  await clickByText(['搜索售后单']);
+  await clickControl('search');
   await sleep(2000);
   await waitForSlider('搜索售后单');
-  await sleep(3000);
+  // 等列表刷新完成（加载提示消失 + 已选计数出现），最多 60s——之前固定 sleep 3s，
+  // 数据量大时列表还在刷新就去点批量导出，按钮 30s 超时
+  const searchSettled = await page.evaluate(() => new Promise(resolve => {{
+    const deadline = Date.now() + 60000;
+    const check = () => {{
+      const text = document.body.innerText;
+      const hasCount = /已选\\s*\\(\\d+\\/\\d+\\)/.test(text);
+      const loading = text.includes('正在加载') || text.includes('加载中');
+      if ((hasCount && !loading) || Date.now() > deadline) resolve(hasCount);
+      else setTimeout(check, 1500);
+    }};
+    check();
+  }})).catch(() => null);
+  console.log(`[INFO] 搜索后列表状态: ${{JSON.stringify(searchSettled)}}`);
   const totalCount = await page.evaluate(() => {{
     const match = document.body.innerText.match(/已选\\s*\\(0\\/(\\d+)\\)/);
     return match ? Number(match[1]) : null;
