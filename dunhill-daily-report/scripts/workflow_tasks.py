@@ -129,6 +129,10 @@ def _error_type(output: str) -> str:
     # 否则日志里偶现“登录”字样会被误标为 auth_required
     if "内不可点击" in output or "控件 " in output:
         return "ui_change"
+    # 页面回读与期望不符（填日期被拒回退默认值等）：T-1 数据未释放时的典型形态，
+    # 须先于 auth 判断——失败输出末尾的排查建议含"登录"字样（2026-08-31 误标事故）
+    if "回读不一致" in output or "期望" in output and "回读" in output:
+        return "data_not_ready"
     # 页面元素点击/等待超时（Playwright locator）。登录态失效也会表现成元素点不动，
     # 但 auth 判断交给 taobao_auth_check gate，这里如实归类为 ui 问题。
     # （2026-08-31 refund/live 的 TimeoutError 被完整输出前段的 auth 字样误标）

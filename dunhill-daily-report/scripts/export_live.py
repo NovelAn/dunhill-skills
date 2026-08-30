@@ -806,14 +806,17 @@ def run_single_extension_stage(
 ) -> bool:
     existing = verify_live_downloads(run_start_ts, mode=mode)
     if len(existing) < expected_file_count(mode):
-        # 本次运行没有新增，但当天早些时候可能已下载成功（DAG 重试场景）——按文件名模式补认
-        today_labels: set[str] = set()
+        # 本次运行没有新增，但当天早些时候可能已下载成功（DAG 重试场景）——按文件名模式补认。
+        # 只认本阶段期望的标签：overview 的文件喂不饱 session（2026-08-31 session 被
+        # 大盘文件误判"当日已有"而跳过，分场次数据实际从未下载）
+        stage_labels = MODE_EXPECTED_LABELS.get(mode, MODE_EXPECTED_LABELS["all"])
         for path in _files_from_today():
-            for label, patterns in LIVE_FILE_PATTERNS.items():
-                if any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns):
-                    today_labels.add(label)
-                    existing.setdefault(label, [str(path)])
-        if mode == "transaction" and any(label.startswith("直播间成交订单明细") for label in today_labels):
+            for label in stage_labels:
+                if label in existing:
+                    continue
+                if any(fnmatch.fnmatch(path.name, pattern) for pattern in LIVE_FILE_PATTERNS[label]):
+                    existing[label] = [str(path)]
+        if mode == "transaction" and any(label.startswith("直播间成交订单明细") for label in existing):
             # 两个时间类型导出的是同一文件名模式，一天内有一份即视为齐了（空表=无订单是合法结果）
             existing.setdefault("直播间成交订单明细_支付时间", existing.get(
                 "直播间成交订单明细_确认收货时间", [str(_files_from_today()[-1]) if _files_from_today() else ""]))

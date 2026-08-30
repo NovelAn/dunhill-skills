@@ -254,16 +254,18 @@ def legacy_run(args: list[str] | None = None) -> int:
     return subprocess.run(command, cwd=str(ROOT_DIR)).returncode
 
 
-def _failed_with_descendants(state: dict, specs: dict[str, TaskSpec]) -> set[str]:
-    selected = {task_id for task_id, receipt in state.get("tasks", {}).items() if receipt.get("status") == "failed"}
-    changed = True
-    while changed:
-        changed = False
-        for task_id, spec in specs.items():
-            if task_id not in selected and any(dep in selected for dep in spec.deps):
-                selected.add(task_id)
-                changed = True
-    return selected
+def _unfinished_tasks(state: dict, specs: dict[str, TaskSpec]) -> set[str]:
+    """重跑集合 = 一切未成功的任务（failed / blocked / pending / running 中断 / 新增 spec）。
+
+    只挑 failed 会漏掉"从未真正跑过"的 blocked 任务：它们的旧票根
+    （dependency_failed / not_schedulable）原样留在 state 里，即使阻塞源
+    已成功也不会被重新调度（2026-08-31 桌面重跑 jycm/quickbi 整排 BLK 的事故）。
+    """
+    return {
+        task_id
+        for task_id in specs
+        if state.get("tasks", {}).get(task_id, {}).get("status") not in {"success", "no_data", "skipped"}
+    }
 
 
 def run_workflow(selected: set[str] | None = None) -> int:
@@ -273,7 +275,7 @@ def run_workflow(selected: set[str] | None = None) -> int:
     if selected is None and state_path.exists():
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
-            selected = _failed_with_descendants(previous, specs) or None
+            selected = _unfinished_tasks(previous, specs) or None
         except (OSError, json.JSONDecodeError):
             pass
     state = DagRunner(specs, state_path).run(selected=selected)
@@ -325,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path = current_run_dir() / "state.json"
         specs = build_task_specs(test_mode=False)
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        return run_workflow(selected=_failed_with_descendants(state, specs))
+        return run_workflow(selected=_unfinished_tasks(state, specs))
     if args.command == "legacy":
         return legacy_run([])
     return 1
