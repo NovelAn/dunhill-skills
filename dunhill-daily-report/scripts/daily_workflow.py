@@ -290,12 +290,11 @@ def _unfinished_tasks(state: dict, specs: dict[str, TaskSpec]) -> set[str]:
     }
 
 
-def run_workflow(selected: set[str] | None = None) -> int:
+def run_workflow(selected: set[str] | None = None, force: bool = False) -> int:
     run_dir = current_run_dir()
     state_path = run_dir / "state.json"
     specs = build_task_specs(test_mode=False)
-    force = False
-    if selected is None and state_path.exists():
+    if selected is None and not force and state_path.exists():
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
             if _stale_before_release(previous):
@@ -310,6 +309,8 @@ def run_workflow(selected: set[str] | None = None) -> int:
                 selected = _unfinished_tasks(previous, specs) or None
         except (OSError, json.JSONDecodeError):
             pass
+    if force:
+        selected = None  # 全量选择 + 穿透指纹闸，凌晨/9 点前的一切票根作废
     state = DagRunner(specs, state_path).run(selected=selected, force=force)
     state = sync_legacy_state(state)
     atomic_write_json(state_path, state)
@@ -329,7 +330,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Dunhill resumable Step 1-2 workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status")
-    subparsers.add_parser("run")
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument(
+        "--force", action="store_true",
+        help="丢弃当日全部票根（含 success），全量重跑——T-1 数据 9 点释放后手动重置用",
+    )
     subparsers.add_parser("resume")
     watch_parser = subparsers.add_parser("watch")
     watch_parser.add_argument("--once", action="store_true")
@@ -350,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(state_path, state)
         return 0
     if args.command == "run":
-        return run_workflow()
+        return run_workflow(force=getattr(args, "force", False))
     if args.command == "resume":
         return run_workflow()
     if args.command == "retry":
