@@ -294,18 +294,23 @@ def run_workflow(selected: set[str] | None = None) -> int:
     run_dir = current_run_dir()
     state_path = run_dir / "state.json"
     specs = build_task_specs(test_mode=False)
+    force = False
     if selected is None and state_path.exists():
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
             if _stale_before_release(previous):
+                # 只入选还不够：DagRunner 内部的指纹跳过会保住 success 旧票根，
+                # 必须 force=True 让全量重跑真正落到执行层（2026-08-31 09:10
+                # 事故：[RESET] 打了，51 张凌晨票根仍被指纹闸挡住未重跑）
                 print(
                     f"[RESET] 今天 {DATA_RELEASE_HOUR}:00 前的运行结果已失效（T-1 数据 9 点后释放），全量重跑。"
                 )
+                force = True
             else:
                 selected = _unfinished_tasks(previous, specs) or None
         except (OSError, json.JSONDecodeError):
             pass
-    state = DagRunner(specs, state_path).run(selected=selected)
+    state = DagRunner(specs, state_path).run(selected=selected, force=force)
     state = sync_legacy_state(state)
     atomic_write_json(state_path, state)
     write_summary(run_dir, state)
