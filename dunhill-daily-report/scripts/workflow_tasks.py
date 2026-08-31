@@ -31,6 +31,10 @@ JYCM_SAVE_NAMES = {
     "446524": "dunhill_client_d_recent_30d_",
     "445350": "dunhill_product_d_recent_1d_",
     "458866": "dunhill_product_traffic_d_recent_1d_",
+    # 周度清单（周日/周一）：30 天窗口报表，命名对齐 config/missions.py weekly_jycm_rpts
+    "453129": "dunhill_product_d_recent_30d_",
+    "224051": "dunhill_product_traffic_d_recent_30d_",
+    "226600": "dunhill_traffic_d_recent_30d_",
 }
 
 QUICKBI_UPLOAD_TARGETS = {
@@ -49,6 +53,10 @@ BACKUP_TARGETS = {
     "446524": "dunhill_tm客户源",
     "445350": "dunhill_tm商品源",
     "458866": "dunhill_tm商品流量源",
+    # 周度清单（周日/周一）：30d 与 1d 报表入同一张目标表，REPLACE 按日期覆盖
+    "453129": "dunhill_tm商品源",
+    "224051": "dunhill_tm商品流量源",
+    "226600": "dunhill_tm流量源_new",
     "tm_order": "dunhill_BI订单源",
     "tm_refund_success": "dunhill_TM退款源_hive",
     "tm_refund_pending": "dunhill_TM退款源_hive",

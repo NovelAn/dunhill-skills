@@ -23,6 +23,21 @@ from scripts.daily_orchestrator import load_config, send_lark_success_notificati
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT_DIR / "runs"
 JYCM_REPORTS = ("445603", "225266", "446524", "445350", "458866")
+# 周日/周一跑周度清单（30 天窗口报表），对齐 run.py 的 weekly_jycm_rpts。
+# 445603/446524 两清单同 ID 同窗口（本就是 recent_30d），周度只多出 3 张：
+# 453129 商品源30d / 224051 商品流量源30d / 226600 流量源30d。
+# 446780 经营参谋直播取数源不跑——字段不全（无互动数据），直播数据走 live_export 链路
+JYCM_WEEKLY_REPORTS = ("453129", "224051", "226600")
+
+
+def jycm_reports_today(now=None) -> tuple[str, ...]:
+    """周日/周一返回日度+周度合集，其余返回日度清单（对齐 run.py 的周切换逻辑）。"""
+    weekday = (now or datetime.now()).isoweekday()  # 1=周一 7=周日
+    if weekday in (1, 7):
+        return JYCM_REPORTS + JYCM_WEEKLY_REPORTS
+    return JYCM_REPORTS
+
+
 QUICKBI_SOURCES = ("tm_order", "tm_refund_success", "tm_refund_pending", "dtc_order", "dtc_refund")
 
 
@@ -67,7 +82,7 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
         task_runner = runner(task_id) if test_mode else _step1_runner(task_id)
         specs[task_id] = TaskSpec(task_id, resources=("chrome_mcp", "browser_downloads"), runner=task_runner)
 
-    for report_id in JYCM_REPORTS:
+    for report_id in jycm_reports_today():
         task_id = f"jycm_download.{report_id}"
         # 无前置：jycm 走 lydaas 域，与 Step1 千牛/直播完全独立。
         # 与 refund/live 的下载并发由 browser_downloads 资源锁互斥
@@ -95,7 +110,7 @@ def build_task_specs(test_mode: bool = False) -> dict[str, TaskSpec]:
     source_tasks = [
         "refund_export",  # 千牛后台退款导出（主退款源，必须每天入库）
         "live_export",  # 直播大盘/场次/订单明细
-        *(f"jycm_download.{report_id}" for report_id in JYCM_REPORTS),
+        *(f"jycm_download.{report_id}" for report_id in jycm_reports_today()),
         # "sycm_download",  # 已下线，取数源走 jycm_download.445603 → dunhill_tm取数源_backup
         *(f"quickbi_api.{source}" for source in QUICKBI_SOURCES),
     ]
