@@ -275,8 +275,12 @@ def step2_command(task_id: str, run_day: date) -> tuple[list[str], int] | None:
 
 
 def _daily_glob(prefix: str, run_day: date) -> str:
-    """当日源文件名统一为 `{prefix}_{YYYYMMDD}*.xlsx`（crawler/下载均带下划线；JYCM_SAVE_NAMES 前缀本身以 _ 结尾）。"""
-    return f"{prefix.rstrip('_')}_{run_day.strftime('%Y%m%d')}*.xlsx"
+    """当日源文件名统一为 `{prefix}_{YYYYMMDD}*.xlsx`（crawler/下载均带下划线；JYCM_SAVE_NAMES 前缀本身以 _ 结尾）。
+
+    中缀 `*`：QuickBI 浏览器兜底导出的文件名带 `_自助取数_HH_MM_SS` 段
+    （2026-09-01 tm_refund_success verify 落空的事故），API 文件不带，两者都要匹配。
+    """
+    return f"{prefix.rstrip('_')}_*{run_day.strftime('%Y%m%d')}*.xlsx"
 
 
 def _source_file_token(source_task: str, run_day: date) -> tuple[str, str] | None:
