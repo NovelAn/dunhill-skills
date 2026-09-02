@@ -305,25 +305,63 @@ def _unfinished_tasks(state: dict, specs: dict[str, TaskSpec]) -> set[str]:
     }
 
 
+def _expire_stuck_running(state: dict, threshold_min: int = 60) -> int:
+    """重置陈旧的 running 任务为 pending——主进程死后状态机自愈。
+
+    之前 run_command 改 Popen 后，timeout 会把子进程树杀掉，主进程不会卡死；
+    但兜底之外仍有残留路径（kill -9 主进程 / OS 重启 / 进程组漏网），
+    state 里 status=running 的任务永远没人清，下次 resume 看到一堆 running
+    不知道死活。threshold_min 默认 60 分钟（live_export 偶发 4-5 分钟、quickbi 5-8 分钟、
+    都远低于阈值）。
+    """
+    if not state.get("tasks"):
+        return 0
+    now = datetime.now()
+    expired = 0
+    for task_id, receipt in list(state["tasks"].items()):
+        if receipt.get("status") != "running":
+            continue
+        started_at = receipt.get("started_at")
+        if started_at:
+            try:
+                age_min = (now - datetime.fromisoformat(started_at)).total_seconds() / 60
+            except ValueError:
+                age_min = threshold_min + 1  # 解析失败也按陈旧处理
+        else:
+            # 没有 started_at（旧 task 票根或 commit 3 之前的现场）也按陈旧处理
+            age_min = threshold_min + 1
+        if age_min > threshold_min:
+            state["tasks"][task_id] = {"status": "pending"}
+            print(f"[EXPIRE] {task_id} 卡 {age_min:.0f}min，重置 pending", flush=True)
+            expired += 1
+    return expired
+
+
 def run_workflow(selected: set[str] | None = None, force: bool = False) -> int:
     run_dir = current_run_dir()
     state_path = run_dir / "state.json"
     specs = build_task_specs(test_mode=False)
-    if selected is None and not force and state_path.exists():
+    if state_path.exists():
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
-            if _stale_before_release(previous):
-                # 只入选还不够：DagRunner 内部的指纹跳过会保住 success 旧票根，
-                # 必须 force=True 让全量重跑真正落到执行层（2026-08-31 09:10
-                # 事故：[RESET] 打了，51 张凌晨票根仍被指纹闸挡住未重跑）
-                print(
-                    f"[RESET] 今天 {DATA_RELEASE_HOUR}:00 前的运行结果已失效（T-1 数据 9 点后释放），全量重跑。"
-                )
-                force = True
-            else:
-                selected = _unfinished_tasks(previous, specs) or None
+            # 启动前先清陈旧 running——主进程死后兜底之外仍有残留路径
+            _expire_stuck_running(previous)
+            atomic_write_json(state_path, previous)
         except (OSError, json.JSONDecodeError):
-            pass
+            previous = None
+    else:
+        previous = None
+    if selected is None and not force and previous is not None:
+        if _stale_before_release(previous):
+            # 只入选还不够：DagRunner 内部的指纹跳过会保住 success 旧票根，
+            # 必须 force=True 让全量重跑真正落到执行层（2026-08-31 09:10
+            # 事故：[RESET] 打了，51 张凌晨票根仍被指纹闸挡住未重跑）
+            print(
+                f"[RESET] 今天 {DATA_RELEASE_HOUR}:00 前的运行结果已失效（T-1 数据 9 点后释放），全量重跑。"
+            )
+            force = True
+        else:
+            selected = _unfinished_tasks(previous, specs) or None
     if force:
         selected = None  # 全量选择 + 穿透指纹闸，凌晨/9 点前的一切票根作废
     state = DagRunner(specs, state_path).run(selected=selected, force=force)

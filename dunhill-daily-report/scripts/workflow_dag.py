@@ -200,7 +200,7 @@ class DagRunner:
                     if self._ready(task_id, state, selected):
                         receipt = state["tasks"].get(task_id, {})
                         attempt = int(receipt.get("attempt", 0)) + 1
-                        state["tasks"][task_id] = {"status": "running", "attempt": attempt}
+                        state["tasks"][task_id] = {"status": "running", "attempt": attempt, "started_at": now_iso()}
                         self._save_state(state)
                         print(f"[RUN] {task_id} (attempt {attempt})", flush=True)
                         pending.remove(task_id)
