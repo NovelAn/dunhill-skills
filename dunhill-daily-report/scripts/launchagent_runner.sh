@@ -32,7 +32,29 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "Python runtime is unavailable:" "$PYTHON_BIN" >> "$RUNNER_LOG"
   exit 127
 fi
-"$PYTHON_BIN" -u scripts/daily_workflow.py run
+
+# 90 分钟 wall-clock 上限：macOS 没 GNU timeout，zsh 内嵌 watchdog。
+# daily_workflow.py run 内部用 Popen(start_new_session=True) 启动 manage.py quickbi
+# 等子进程（commit 2 已修）。watchdog 通过 PGID（start_new_session 让主进程独占 PG）
+# 一次 kill 整组；macOS shell `/bin/kill -TERM -PGID` 走 BSD 路径，可用。
+RUN_TIMEOUT_SEC=${DUNHILL_RUN_TIMEOUT_SEC:-5400}  # 90 min
+"$PYTHON_BIN" -u scripts/daily_workflow.py run &
+RUN_PID=$!
+RUN_PGID=$(ps -o pgid= -p "$RUN_PID" | tr -d ' ')
+(
+  sleep "$RUN_TIMEOUT_SEC"
+  if kill -0 "$RUN_PID" 2>/dev/null; then
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "LaunchAgent timeout: killing PGID $RUN_PGID after ${RUN_TIMEOUT_SEC}s" >> "$RUNNER_LOG"
+    # 先 SIGTERM 让子进程树优雅退出（依赖 commit 2 的 start_new_session）
+    /bin/kill -TERM -"$RUN_PGID" 2>/dev/null
+    sleep 5
+    /bin/kill -KILL -"$RUN_PGID" 2>/dev/null
+  fi
+) &
+WATCH_PID=$!
+
+wait "$RUN_PID"
 exit_code=$?
+kill -KILL "$WATCH_PID" 2>/dev/null
 printf '%s %s %d\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "LaunchAgent run exited with code" "$exit_code" >> "$RUNNER_LOG"
 exit "$exit_code"
