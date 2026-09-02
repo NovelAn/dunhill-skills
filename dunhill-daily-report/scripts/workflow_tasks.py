@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -83,15 +85,73 @@ def _uploader(*args: str) -> list[str]:
     return [str(DATA_IMPORT_PYTHON), "-m", "data_pipeline.processors.file_uploader", *args]
 
 
-def run_command(command: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _descendants(pid: int) -> list[int]:
+    """列同 PG 所有 PID（覆盖已 reparent 到 init 的孙子）。
+
+    start_new_session=True 后主进程独占 PG，所有沿父链继承 PG 的子孙（Chrome/Playwright）
+    都在这个 PG 里。pgrep -P 只能追直接子进程，shell fork 后 exec 的孙子 ppid=1 拿不到；
+    列同 PG 一步到位。
+    """
+    try:
+        pgid = os.getpgid(pid)
+        same_pg = subprocess.run(
+            ["pgrep", "-g", str(pgid)], capture_output=True, text=True, timeout=3
+        ).stdout.split()
+    except Exception:
+        return []
+    return [int(p) for p in same_pg if p != str(pid)]
+
+
+def _kill_process_tree(pid: int, sig: int) -> None:
+    """递归列子孙、再按反向（叶子先杀）发信号。
+
+    start_new_session=True 后子进程独立 PG，os.killpg 会被 PermissionError 挡住，
+    shell `/bin/kill -- -pgid` 也被 BSD 语法拒（仅 Linux 支持）。
+    最稳的方式：递归 pgrep -P 拿所有子孙 PID 一一杀。
+    """
+    # 先杀孙子重孙，再杀直接子进程，最后杀主进程
+    descendants = _descendants(pid)
+    for d_pid in reversed(descendants):
+        try:
+            os.kill(d_pid, sig)
+        except ProcessLookupError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_command(command: list[str], cwd: Path, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with process-tree kill on timeout.
+
+    之前 subprocess.run(timeout=...) 在 socket IO 卡死时无效：socket 在 OS 内核里阻塞，
+    Python 永远不会触发 TimeoutExpired，主进程无限等。改 Popen + communicate(timeout)
+    + `_kill_process_tree` 走 pgrep 反向追子孙，SIGTERM/SIGKILL 走整组。
+    """
+    proc = subprocess.Popen(
         command,
         cwd=str(cwd),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
+        start_new_session=True,  # 独立 PG，子孙跟主进程在同一 PG 下能 kill
+        env=env,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+        raise
+    return subprocess.CompletedProcess(
+        command, proc.returncode, stdout or "", stderr or ""
     )
 
 
@@ -240,7 +300,10 @@ def step2_command(task_id: str, run_day: date) -> tuple[list[str], int] | None:
     if task_id == "sycm_download":
         return _manage("sycm", "shop"), STEP2_TIMEOUTS["sycm"]
     if task_id.startswith("quickbi_api."):
-        return _manage("quickbi"), STEP2_TIMEOUTS["quickbi"]
+        # 单源抓取：每个 task 只跑自己的源，5 个 task 真正并行
+        # （manage.py quickbi --sources X 由 commit 1 在 data-import 仓库支持）
+        source = task_id.split(".", 1)[1]
+        return _manage("quickbi", "--sources", source), STEP2_TIMEOUTS["quickbi"]
     if task_id.startswith("targeted_upload."):
         source_task = task_id.split(".", 1)[1]
         if source_task == "refund_export":
@@ -450,20 +513,11 @@ def run_step2_task(task_id: str, root_dir: Path, upstream_state: dict | None = N
 def _run_subprocess(task_id: str, mapping: tuple[list[str], int]) -> TaskResult:
     started = time.time()
     command, timeout = mapping
-    env = {**__import__("os").environ, "PYTHONPATH": str(DATA_IMPORT_DIR / "src")}
+    env = {**os.environ, "PYTHONPATH": str(DATA_IMPORT_DIR / "src")}
     try:
-        result = subprocess.run(
-            command,
-            cwd=str(DATA_IMPORT_DIR),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
+        result = run_command(command, DATA_IMPORT_DIR, timeout, env=env)
     except subprocess.TimeoutExpired as error:
-        return TaskResult.failed(task_id, "transient_network", retryable=True, evidence={"message": str(error)})
+        return TaskResult.failed(task_id, "transient_network", retryable=True, evidence={"message": str(error), "pid_killed": True})
     output = f"{result.stdout}\n{result.stderr}"
     if result.returncode != 0:
         error_type = _error_type(output)
