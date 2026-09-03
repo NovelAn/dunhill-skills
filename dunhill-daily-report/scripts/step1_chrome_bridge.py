@@ -112,6 +112,15 @@ def main() -> int:
                 print(f"[FAIL] QuickBI supplement export failed: {source}")
                 failed.append(f"quickbi:{source}")
 
+    # 把 Chrome 会话 cookies（含 httpOnly）合并回 ~/auth.json，供 Step2 纯 requests
+    # 任务复用——消除扫码依赖（auth.json 快照 2-3 天过期）。同步失败不判 Step1 失败：
+    # auth.json 里旧 cookies 可能还够用，只打 WARN。
+    if run_script([sys.executable, "-u", str(SCRIPT_DIR / "sync_auth_from_chrome.py")]):
+        record_task("auth_sync", "success")
+    else:
+        record_task("auth_sync", "failed")
+        print("[WARN] auth.json cookie sync failed (non-fatal)")
+
     if failed:
         print("\n[FAIL] Step 1 failed tasks: " + ", ".join(failed))
         return 1
